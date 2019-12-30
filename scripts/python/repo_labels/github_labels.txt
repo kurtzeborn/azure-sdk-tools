@@ -62,6 +62,7 @@ Kusto
 Lab Services 
 Logic App
 Managed Identity
+ManagedServices
 Machine Learning
 Machine Learning Compute
 Machine Learning Experimentation
@@ -112,6 +113,7 @@ Server Management
 Service Bus
 Service Fabric
 Service Map
+SignalR
 SQL
 Storage
 Storsimple
@@ -121,3 +123,4 @@ Tables
 TimeseriesInsights
 Visual Studio
 vFXT
+Web Apps
