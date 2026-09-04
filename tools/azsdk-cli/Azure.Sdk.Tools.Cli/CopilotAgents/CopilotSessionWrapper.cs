@@ -1,4 +1,4 @@
-using GitHub.Copilot.SDK;
+using GitHub.Copilot;
 
 namespace Azure.Sdk.Tools.Cli.CopilotAgents;
 
@@ -8,7 +8,7 @@ namespace Azure.Sdk.Tools.Cli.CopilotAgents;
 public class CopilotSessionWrapper(CopilotSession session) : ICopilotSessionWrapper
 {
 
-    public IDisposable On(SessionEventHandler handler)
+    public IDisposable On(Action<SessionEvent> handler)
     {
         return session.On(handler);
     }
@@ -18,8 +18,10 @@ public class CopilotSessionWrapper(CopilotSession session) : ICopilotSessionWrap
         return session.SendAsync(options, cancellationToken);
     }
 
+#pragma warning disable AZSDK001 // IAsyncDisposable.DisposeAsync has a fixed signature
     public ValueTask DisposeAsync()
     {
         return session.DisposeAsync();
     }
+#pragma warning restore AZSDK001
 }

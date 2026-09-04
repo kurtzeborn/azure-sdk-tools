@@ -6,8 +6,10 @@ using Azure.Sdk.Tools.Cli.Helpers;
 using Azure.Sdk.Tools.Cli.Services;
 using Azure.Sdk.Tools.Cli.Services.TypeSpec;
 using Azure.Sdk.Tools.Cli.Tests.TestHelpers;
-using GitHub.Copilot.SDK;
+using GitHub.Copilot;
 using Moq;
+
+using static Azure.Sdk.Tools.Cli.Tests.TestHelpers.TestCategories;
 
 namespace Azure.Sdk.Tools.Cli.Tests.Services.TypeSpec;
 
@@ -60,17 +62,11 @@ internal class TypeSpecCustomizationServiceTests
     /// <summary>
     /// Live integration test that makes actual LLM calls through the GitHub Copilot SDK.
     /// Requires GitHub Copilot CLI to be installed and authenticated.
-    /// Will be skipped if Copilot is not available.
     /// </summary>
-    [Test]
-    [Explicit]  // Mark as explicit/manual because this test takes 26 seconds
+    [Test, Explicit]
+    [Category(CopilotAgent)]
     public async Task ApplyCustomization_WithRealCopilotSdk_CompletesSuccessfully()
     {
-        if (!await CopilotTestHelper.IsCopilotAvailableAsync())
-        {
-            Assert.Ignore("Skipping test as GitHub Copilot CLI is either not installed or not authenticated.");
-        }
-
         var logger = new TestLogger<TypeSpecCustomizationService>();
         var rawOutputHelper = Mock.Of<IRawOutputHelper>();
         var npxHelper = new NpxHelper(
@@ -78,13 +74,13 @@ internal class TypeSpecCustomizationServiceTests
             rawOutputHelper);
         var tokenUsageHelper = new TokenUsageHelper(rawOutputHelper);
         var gitHelper = CreateRealGitHelper();
-        var typeSpecHelper = new TypeSpecHelper(gitHelper);
+        var processHelper = new ProcessHelper(new TestLogger<ProcessHelper>(), rawOutputHelper);
+        var typeSpecHelper = new TypeSpecHelper(gitHelper, processHelper);
 
         // Create real CopilotClient - this will use GitHub credentials
         var copilotClient = new CopilotClient(new CopilotClientOptions
         {
-            UseStdio = true,
-            AutoStart = true
+            Connection = RuntimeConnection.ForStdio()
         });
         var copilotClientWrapper = new CopilotClientWrapper(copilotClient);
         var copilotAgentRunner = new CopilotAgentRunner(
@@ -136,7 +132,8 @@ internal class TypeSpecCustomizationServiceTests
         var copilotAgentRunner = Mock.Of<ICopilotAgentRunner>();
         var npxHelper = Mock.Of<INpxHelper>();
         var tokenUsageHelper = new TokenUsageHelper(Mock.Of<IRawOutputHelper>());
-        var typeSpecHelper = new TypeSpecHelper(Mock.Of<IGitHelper>());
+        var processHelper = new ProcessHelper(new TestLogger<ProcessHelper>(), Mock.Of<IRawOutputHelper>());
+        var typeSpecHelper = new TypeSpecHelper(Mock.Of<IGitHelper>(), processHelper);
         var gitHelper = Mock.Of<IGitHelper>();
 
         var service = new TypeSpecCustomizationService(
@@ -163,7 +160,8 @@ internal class TypeSpecCustomizationServiceTests
         var npxHelper = Mock.Of<INpxHelper>();
         var tokenUsageHelper = new TokenUsageHelper(Mock.Of<IRawOutputHelper>());
         var gitHelper = CreateRealGitHelper();
-        var typeSpecHelper = new TypeSpecHelper(gitHelper);
+        var processHelper = new ProcessHelper(new TestLogger<ProcessHelper>(), Mock.Of<IRawOutputHelper>());
+        var typeSpecHelper = new TypeSpecHelper(gitHelper, processHelper);
 
         var service = new TypeSpecCustomizationService(
             logger,
@@ -188,7 +186,7 @@ internal class TypeSpecCustomizationServiceTests
         var gitHelper = CreateRealGitHelper();
 
         // Discover repo root from the test project path
-        var repoRoot = await gitHelper.DiscoverRepoRootAsync(typeSpecProjectPath);
+        var repoRoot = await gitHelper.DiscoverRepoRootAsync(typeSpecProjectPath, CancellationToken.None);
         Assert.That(repoRoot, Is.Not.Null.And.Not.Empty, "Should find repository root");
 
         // Check that the reference doc exists at the expected location

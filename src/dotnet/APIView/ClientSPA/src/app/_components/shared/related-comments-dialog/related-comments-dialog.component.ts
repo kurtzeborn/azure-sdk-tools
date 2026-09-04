@@ -13,6 +13,7 @@ import { CodePanelRowData } from 'src/app/_models/codePanelModels';
 import { UserProfile } from 'src/app/_models/userProfile';
 import { PermissionsService } from 'src/app/_services/permissions/permissions.service';
 import { ReviewContextService } from 'src/app/_services/review-context/review-context.service';
+import { TooltipModule } from 'primeng/tooltip';
 import { environment } from 'src/environments/environment';
 import { CommentSeverityHelper } from 'src/app/_helpers/comment-severity.helper';
 import { AI_COMMENT_FEEDBACK_REASONS } from 'src/app/_models/comment-feedback-reasons';
@@ -44,7 +45,8 @@ export interface CommentResolutionData {
         MultiSelectModule,
         TimeagoModule,
         CommentSeverityComponent,
-        MarkdownToHtmlPipe
+        MarkdownToHtmlPipe,
+        TooltipModule
     ]
 })
 export class RelatedCommentsDialogComponent implements OnInit, OnChanges {
@@ -187,6 +189,7 @@ export class RelatedCommentsDialogComponent implements OnInit, OnChanges {
       this.selectedCommentIds.add(commentId);
     }
     this.updateSelectAllState();
+    this.ensureDispositionIsValid();
   }
 
   onSelectAllChange(event: { checked?: boolean }) {
@@ -199,6 +202,7 @@ export class RelatedCommentsDialogComponent implements OnInit, OnChanges {
     } else {
       this.selectedCommentIds.clear();
     }
+    this.ensureDispositionIsValid();
   }
 
   updateSelectAllState() {
@@ -272,6 +276,17 @@ export class RelatedCommentsDialogComponent implements OnInit, OnChanges {
       : this.relatedComments;
 
     return commentsToCheck.some(c => c.createdBy === 'azure-sdk');
+  }
+
+  get filteredDispositionOptions() {
+    return this.dispositionOptions;
+  }
+
+  private ensureDispositionIsValid() {
+    const valid = this.filteredDispositionOptions.some(o => o.value === this.selectedDisposition);
+    if (!valid) {
+      this.selectedDisposition = 'keepOpen';
+    }
   }
 
   isFeedbackReasonSelected(reason: string): boolean {

@@ -1,11 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-using System.Text;
+
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.CommandLine.Parsing;
-using Microsoft.Extensions.Logging;
 using Azure.Sdk.Tools.Cli.Models;
 using Azure.Sdk.Tools.Cli.Models.Responses.Package;
 
@@ -18,8 +16,9 @@ namespace Azure.Sdk.Tools.Cli.Helpers
     public interface ISpecGenSdkConfigHelper
     {
         // Config value retrieval methods
-        Task<T> GetConfigValueFromRepoAsync<T>(string repositoryRoot, string jsonPath);
-        Task<(SpecGenSdkConfigContentType type, string value)> GetConfigurationAsync(string repositoryRoot, SpecGenSdkConfigType configType);
+        Task<T> GetConfigValueFromRepoAsync<T>(string repositoryRoot, string jsonPath, CancellationToken ct);
+        Task<(SpecGenSdkConfigContentType type, string value)> GetConfigurationAsync(string repositoryRoot, SpecGenSdkConfigType configType, CancellationToken ct);
+        Task<string> GetSdkBreakingChangePatternFileConfigurationAsync(string repositoryRoot, CancellationToken ct);
 
         // Command processing methods
         string SubstituteCommandVariables(string command, Dictionary<string, string> variables);
@@ -63,10 +62,13 @@ namespace Azure.Sdk.Tools.Cli.Helpers
         private const string BuildScriptPathJsonPath = "packageOptions/buildScript/path";
         private const string UpdateChangelogContentCommandJsonPath = "packageOptions/updateChangelogContentScript/command";
         private const string UpdateChangelogContentScriptPathJsonPath = "packageOptions/updateChangelogContentScript/path";
+        private const string GetSdkChangesCommandJsonPath = "packageOptions/getSdkChangesScript/command";
+        private const string GetSdkChangesScriptPathJsonPath = "packageOptions/getSdkChangesScript/path";
         private const string UpdateVersionCommandJsonPath = "packageOptions/updateVersionScript/command";
         private const string UpdateVersionScriptPathJsonPath = "packageOptions/updateVersionScript/path";
         private const string UpdateMetadataCommandJsonPath = "packageOptions/updateMetadataScript/command";
         private const string UpdateMetadataScriptPathJsonPath = "packageOptions/updateMetadataScript/path";
+        private const string SdkBreakingChangePatternFilePath = "packageOptions/sdkBreakingChangePatternFile";
         private const string SpecToSdkConfigPath = "eng/swagger_to_sdk_config.json";
 
         private readonly ILogger<SpecGenSdkConfigHelper> _logger;
@@ -79,7 +81,7 @@ namespace Azure.Sdk.Tools.Cli.Helpers
         }
 
         // Gets a configuration value from the swagger_to_sdk_config.json file
-        public async Task<T> GetConfigValueFromRepoAsync<T>(string repositoryRoot, string jsonPath)
+        public async Task<T> GetConfigValueFromRepoAsync<T>(string repositoryRoot, string jsonPath, CancellationToken ct)
         {
             var specToSdkConfigFilePath = Path.Combine(repositoryRoot, SpecToSdkConfigPath);
 
@@ -93,7 +95,7 @@ namespace Azure.Sdk.Tools.Cli.Helpers
             try
             {
                 // Read and parse the configuration file
-                var configContent = await File.ReadAllTextAsync(specToSdkConfigFilePath);
+                var configContent = await File.ReadAllTextAsync(specToSdkConfigFilePath, ct);
                 using var configJson = JsonDocument.Parse(configContent);
 
                 // Use helper method to navigate JSON path
@@ -120,14 +122,14 @@ namespace Azure.Sdk.Tools.Cli.Helpers
         }
 
         // Get configuration for a specific type (either command or script path)
-        public async Task<(SpecGenSdkConfigContentType type, string value)> GetConfigurationAsync(string repositoryRoot, SpecGenSdkConfigType configType)
+        public async Task<(SpecGenSdkConfigContentType type, string value)> GetConfigurationAsync(string repositoryRoot, SpecGenSdkConfigType configType, CancellationToken ct)
         {
             var (commandPath, scriptPath) = GetConfigPaths(configType);
             
             // Try command first
             try
             {
-                var command = await GetConfigValueFromRepoAsync<string>(repositoryRoot, commandPath);
+                var command = await GetConfigValueFromRepoAsync<string>(repositoryRoot, commandPath, ct);
                 if (!string.IsNullOrEmpty(command))
                 {
                     _logger.LogDebug("Found {ConfigType} command configuration", configType);
@@ -143,7 +145,7 @@ namespace Azure.Sdk.Tools.Cli.Helpers
             // Try path
             try
             {
-                var path = await GetConfigValueFromRepoAsync<string>(repositoryRoot, scriptPath);
+                var path = await GetConfigValueFromRepoAsync<string>(repositoryRoot, scriptPath, ct);
                 if (!string.IsNullOrEmpty(path))
                 {
                     _logger.LogDebug("Found {ConfigType} script path configuration", configType);
@@ -160,6 +162,23 @@ namespace Azure.Sdk.Tools.Cli.Helpers
             return (SpecGenSdkConfigContentType.Unknown, string.Empty);
         }
 
+        public async Task<string> GetSdkBreakingChangePatternFileConfigurationAsync(string repositoryRoot, CancellationToken ct)
+        {
+            try
+            {
+                return await GetConfigValueFromRepoAsync<string>(repositoryRoot, SdkBreakingChangePatternFilePath, ct);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogDebug("No {configOption} configuration found. Error: {errorMessage}", SdkBreakingChangePatternFilePath, ex.Message);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error occurred while retrieving SDK breaking change pattern file path.");
+            }
+
+            return string.Empty;
+        }
         // Substitute template variables in command strings
         public string SubstituteCommandVariables(string command, Dictionary<string, string> variables)
         {
@@ -235,6 +254,7 @@ namespace Azure.Sdk.Tools.Cli.Helpers
                 SpecGenSdkConfigType.UpdateChangelogContent => (UpdateChangelogContentCommandJsonPath, UpdateChangelogContentScriptPathJsonPath),
                 SpecGenSdkConfigType.UpdateVersion => (UpdateVersionCommandJsonPath, UpdateVersionScriptPathJsonPath),
                 SpecGenSdkConfigType.UpdateMetadata => (UpdateMetadataCommandJsonPath, UpdateMetadataScriptPathJsonPath),
+                SpecGenSdkConfigType.GetSdkChanges => (GetSdkChangesCommandJsonPath, GetSdkChangesScriptPathJsonPath),
                 _ => throw new ArgumentException($"Unsupported config type: {configType}")
             };
         }
@@ -342,7 +362,7 @@ namespace Azure.Sdk.Tools.Cli.Helpers
                 timeout: TimeSpan.FromMinutes(timeoutMinutes)
             );
 
-            _logger.LogInformation("Created command process options: {Command} {Args}", options.Command, string.Join(" ", options.Args));
+            _logger.LogDebug("Created command process options: {Command} {Args}", options.Command, string.Join(" ", options.Args));
             return options;
         }
 
@@ -401,6 +421,7 @@ namespace Azure.Sdk.Tools.Cli.Helpers
     {
         Build,
         UpdateChangelogContent,
+        GetSdkChanges,
         UpdateVersion,
         UpdateMetadata
     }

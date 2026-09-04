@@ -1,9 +1,10 @@
 import { HttpClient, HttpHeaders, HttpParams } from '@angular/common/http';
 import { Injectable } from '@angular/core';
-import { Observable, map, take } from 'rxjs';
+import { Observable, catchError, map, shareReplay, take, tap, throwError } from 'rxjs';
 
 import { PaginatedResult } from 'src/app/_models/pagination';
 import { APIRevision, APIRevisionGroupedByLanguage } from 'src/app/_models/revision';
+import { ReviewQualityScore } from 'src/app/_models/reviewQualityScore';
 import { ConfigService } from '../config/config.service';
 import { ActivatedRoute } from '@angular/router';
 import { INDEX_PAGE_NAME } from 'src/app/_helpers/router-helpers';
@@ -14,7 +15,9 @@ import { INDEX_PAGE_NAME } from 'src/app/_helpers/router-helpers';
 export class APIRevisionsService {
   baseUrl : string = this.configService.apiUrl + "APIRevisions";
   paginatedResult: PaginatedResult<APIRevision[]> = new PaginatedResult<APIRevision[]>
-  
+  private revisionOptionsCache = new Map<string, Map<string, APIRevision>>();
+  private revisionOptionsQueryCache = new Map<string, Observable<APIRevision[]>>();
+
   constructor(private http: HttpClient, private configService: ConfigService) { }
 
   getLatestAPIRevision(reviewId: string): Observable<APIRevision> {
@@ -26,7 +29,7 @@ export class APIRevisionsService {
   }
 
   getAPIRevisions(noOfItemsRead: number, pageSize: number,
-    reviewId : string, label: string | undefined = undefined, author: string | undefined = undefined, 
+    reviewId : string, label: string | undefined = undefined, author: string | undefined = undefined,
     details: string [] = [], sortField: string = "lastUpdatedOn", sortOrder: number = 1, isDeleted: boolean = false,
     isAssignedToMe: boolean = false, withTreeStyleTokens: boolean = false, apiRevisionIds: string[] = []
     ): Observable<PaginatedResult<APIRevision[]>> {
@@ -50,13 +53,13 @@ export class APIRevisionsService {
     const headers = new HttpHeaders({
       'Content-Type': 'application/json',
     })
-       
+
     return this.http.post<APIRevision[]>(this.baseUrl, data,
-      { 
+      {
         headers:headers,
         params: params,
-        observe: 'response', 
-        withCredentials: true 
+        observe: 'response',
+        withCredentials: true
       }).pipe(
           map((response : any) => {
             if (response.body) {
@@ -72,6 +75,40 @@ export class APIRevisionsService {
     );
   }
 
+  cacheAPIRevisionOptions(reviewId: string, apiRevisions: APIRevision[]): void {
+    const cachedRevisions = this.revisionOptionsCache.get(reviewId) ?? new Map<string, APIRevision>();
+    for (const apiRevision of apiRevisions) {
+      cachedRevisions.set(apiRevision.id, apiRevision);
+    }
+    this.revisionOptionsCache.set(reviewId, cachedRevisions);
+  }
+
+  getCachedAPIRevisionOptions(reviewId: string): APIRevision[] {
+    return Array.from(this.revisionOptionsCache.get(reviewId)?.values() ?? []);
+  }
+
+  getFilteredAPIRevisionOptions(reviewId: string, details: string[]): Observable<APIRevision[]> {
+    const queryKey = JSON.stringify([reviewId, details]);
+    const cachedQuery = this.revisionOptionsQueryCache.get(queryKey);
+    if (cachedQuery) {
+      return cachedQuery;
+    }
+
+    const query = this.getAPIRevisions(
+      0, 100, reviewId, undefined, undefined, details, 'createdOn', 1, false, false, true
+    ).pipe(
+      map(response => Array.isArray(response.result) ? response.result : []),
+      tap(apiRevisions => this.cacheAPIRevisionOptions(reviewId, apiRevisions)),
+      catchError(error => {
+        this.revisionOptionsQueryCache.delete(queryKey);
+        return throwError(() => error);
+      }),
+      shareReplay({ bufferSize: 1, refCount: false })
+    );
+    this.revisionOptionsQueryCache.set(queryKey, query);
+    return query;
+  }
+
   deleteAPIRevisions(reviewId: string, revisionIds: string[]): Observable<any> {
     const headers = new HttpHeaders({
       'Content-Type': 'application/json',
@@ -81,10 +118,10 @@ export class APIRevisionsService {
       reviewId: reviewId,
       apiRevisionIds: revisionIds
     };
-   
+
     return this.http.put<any>(this.baseUrl + '/delete', data,
-    { 
-      headers: headers, 
+    {
+      headers: headers,
       withCredentials: true,
       observe: 'response'
     });
@@ -99,10 +136,10 @@ export class APIRevisionsService {
       reviewId: reviewId,
       apiRevisionIds: revisionIds
     };
-   
+
     return this.http.put<any>(this.baseUrl + '/restore', data,
-    { 
-      headers: headers, 
+    {
+      headers: headers,
       withCredentials: true,
       observe: 'response'
     });
@@ -114,7 +151,7 @@ export class APIRevisionsService {
     });
 
     return this.http.post<APIRevision>(this.baseUrl + `/${reviewId}/${apiRevisionId}`, { approve: approve },
-    { 
+    {
       headers: headers,
       withCredentials: true,
     });
@@ -160,8 +197,8 @@ export class APIRevisionsService {
   }
 
   generateAIReview(
-    reviewId: string, 
-    activeApiRevisionId: string, 
+    reviewId: string,
+    activeApiRevisionId: string,
     diffApiRevisionId: string | undefined = undefined
   ): Observable<number> {
     const headers = new HttpHeaders({
@@ -174,11 +211,15 @@ export class APIRevisionsService {
     }
 
     return this.http.post<number>(this.baseUrl + `/${reviewId}/generateReview`, {},
-    { 
+    {
       headers: headers,
       params: params,
       withCredentials: true,
     });
+  }
+
+  getQualityScore(apiRevisionId: string): Observable<ReviewQualityScore> {
+    return this.http.get<ReviewQualityScore>(this.baseUrl + `/${apiRevisionId}/qualityScore`, { withCredentials: true });
   }
 
   private isIndexPage(currentRoute: ActivatedRoute): Observable<boolean> {

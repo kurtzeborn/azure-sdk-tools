@@ -23,7 +23,7 @@ csv_database: CsvDatabase
 
 start_time_secs: float
 
-timeout_secs: float = 45 * 60 * 60  # 45 minutes
+timeout_secs: float = 50 * 60  # 50 minutes
 
 clean_tmp_dir: bool = True
 tmp_folder: str = "tmp"
@@ -131,12 +131,17 @@ def process_release(operation: OperationConfiguration, sdk: SdkConfiguration, re
             logging.info(f"Input JSON for worker: {input_json}")
             json.dump(input_json, f_out, indent=2)
 
-        # run script
-        logging.info(f"Running worker: {sdk.script.run}")
-        start = time.perf_counter()
-        subprocess.check_call([sdk.script.run, input_json_path, output_json_path], cwd=root_path)
-        end = time.perf_counter()
-        logging.info(f"Worker ran: {str(timedelta(seconds=end-start))}")
+        try:
+            # run script
+            logging.info(f"Running worker: {sdk.script.run}")
+            start = time.perf_counter()
+            subprocess.check_call([sdk.script.run, input_json_path, output_json_path], cwd=root_path)
+            end = time.perf_counter()
+            logging.info(f"Worker ran: {str(timedelta(seconds=end-start))}")
+        except Exception as e:
+            report.statuses[release.tag] = "failed at worker"
+            report.aggregated_error.errors.append(e)
+            return
 
         # parse output.json
         release_name = release.tag
@@ -193,7 +198,9 @@ def process_release(operation: OperationConfiguration, sdk: SdkConfiguration, re
             subprocess.check_call(cmd, cwd=example_repo_path)
 
             # git push
-            remote_uri = "https://" + github_token + "@" + operation.sdk_examples_repository[len("https://") :]
+            remote_uri = (
+                "https://x-access-token:" + github_token + "@" + operation.sdk_examples_repository[len("https://") :]
+            )
             cmd = ["git", "push", remote_uri, branch]
             # do not print this as it contains token
             # logging.info('Command line: ' + ' '.join(cmd))
@@ -371,7 +378,7 @@ def main():
         "--language",
         type=str,
         required=False,
-        help='Process SDK for specific language. Currently supports "java" and "go".',
+        help='Process SDK for specific language. Currently supports "java", "go", "js", "dotnet", "python".',
     )
     parser.add_argument(
         "--persist-data",

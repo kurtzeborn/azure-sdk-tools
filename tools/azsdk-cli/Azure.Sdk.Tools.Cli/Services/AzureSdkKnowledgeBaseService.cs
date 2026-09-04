@@ -3,6 +3,8 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Azure.Core;
+using Azure.Identity;
 using Azure.Sdk.Tools.Cli.Models.AzureSdkKnowledgeAICompletion;
 using Azure.Sdk.Tools.Cli.Options;
 using Microsoft.Extensions.Options;
@@ -16,6 +18,7 @@ namespace Azure.Sdk.Tools.Cli.Services
     public class AzureSdkKnowledgeBaseService : IAzureSdkKnowledgeBaseService
     {
         private IPublicClientApplication? _msalApp;
+        private TokenCredential? _tokenCredential;
 
         private readonly HttpClient _httpClient;
         private readonly ILogger<AzureSdkKnowledgeBaseService> _logger;
@@ -24,14 +27,14 @@ namespace Azure.Sdk.Tools.Cli.Services
         private readonly IList<string> scopes = new List<string>();
         private const string authUrl = "https://login.microsoftonline.com/organizations/";
 
-        private readonly object _initializeLock = new();
+        private readonly SemaphoreSlim _initializeSemaphore = new(1, 1);
         private bool _initialized = false;
 
         private static readonly ServiceInfo DefaultAzureSdkKnowledgeService = new()
         {
-            Endpoint = "https://azuresdkqabot-dev-serve-authoring-epgbcvbpa3adcvcu.westus2-01.azurewebsites.net",
-            ClientId = "830f1656-8b36-4e8e-9781-87ccdd038644",
-            AuthScope = "api://azure-sdk-qa-bot-dev/token"
+            Endpoint = "https://azuresdkqabot-server-c8czabhzhweadwgu.westus2-01.azurewebsites.net",
+            ClientId = "899da762-d510-48f2-911a-db9ea0cc41fd",
+            AuthScope = "api://azure-sdk-qa-bot/token"
         };
 
         public AzureSdkKnowledgeBaseService(
@@ -64,6 +67,25 @@ namespace Azure.Sdk.Tools.Cli.Services
                 _options.AuthScope = DefaultAzureSdkKnowledgeService.AuthScope;
                 _options.ClientId = DefaultAzureSdkKnowledgeService.ClientId;
             }
+            // Detect Azure DevOps pipeline environment via SYSTEM_ACCESSTOKEN.
+            // When running in a pipeline, use AzurePipelinesCredential directly.
+            var systemAccessToken = Environment.GetEnvironmentVariable("SYSTEM_ACCESSTOKEN");
+            if (!string.IsNullOrEmpty(systemAccessToken))
+            {
+                var pipelinesClientID = Environment.GetEnvironmentVariable("AZURESUBSCRIPTION_CLIENT_ID");
+                var pipelinesTenantID = Environment.GetEnvironmentVariable("AZURESUBSCRIPTION_TENANT_ID");
+                var serviceConnectionID = Environment.GetEnvironmentVariable("AZURESUBSCRIPTION_SERVICE_CONNECTION_ID");
+                if (!string.IsNullOrEmpty(pipelinesClientID) && !string.IsNullOrEmpty(pipelinesTenantID) && !string.IsNullOrEmpty(serviceConnectionID))
+                {
+                    _logger.LogInformation("Detected Azure DevOps pipeline environment with service connection. Initializing AzurePipelinesCredential for authentication.");
+                    _tokenCredential = new AzurePipelinesCredential(pipelinesTenantID, pipelinesClientID, serviceConnectionID, systemAccessToken, null);
+                }
+            }
+
+            if (_tokenCredential == null)
+            {
+                _tokenCredential = new AzureCliCredential();
+            }
 
             if (!string.IsNullOrEmpty(_options.ClientId))
             {
@@ -90,14 +112,24 @@ namespace Azure.Sdk.Tools.Cli.Services
             _initialized = true;
         }
 
-        private void Initialize()
+        private async Task Initialize(CancellationToken ct)
         {
-            lock (_initializeLock)
+            if (_initialized)
+            {
+                return;
+            }
+
+            await _initializeSemaphore.WaitAsync(ct);
+            try
             {
                 if (!_initialized)
                 {
                     _initialize();
                 }
+            }
+            finally
+            {
+                _initializeSemaphore.Release();
             }
         }
 
@@ -112,7 +144,7 @@ namespace Azure.Sdk.Tools.Cli.Services
                 throw new ArgumentException("Request validation failed", nameof(request));
             }
 
-            Initialize();
+            await Initialize(cancellationToken);
 
             try
             {
@@ -120,10 +152,10 @@ namespace Azure.Sdk.Tools.Cli.Services
 
                 using var httpRequest = new HttpRequestMessage(HttpMethod.Post, requestUri);
 
-                var authResult = await RetrieveAiCompletionAccessTokenAsync(cancellationToken);
-                if (authResult != null && !string.IsNullOrEmpty(authResult.AccessToken))
+                var token = await RetrieveAiCompletionAccessTokenAsync(cancellationToken);
+                if (!string.IsNullOrEmpty(token))
                 {
-                    httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authResult.AccessToken);
+                    httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
                 }
 
                 httpRequest.Content = JsonContent.Create(request, options: _jsonOptions);
@@ -206,8 +238,23 @@ namespace Azure.Sdk.Tools.Cli.Services
             return isValid;
         }
 
-        private async Task<AuthenticationResult> RetrieveAiCompletionAccessTokenAsync(CancellationToken cancellationToken = default)
+        private async Task<string> RetrieveAiCompletionAccessTokenAsync(CancellationToken cancellationToken = default)
         {
+            if (_tokenCredential != null)
+            {
+                _logger.LogInformation("Using Azure credential for authentication");
+                try
+                {
+                    var tokenRequestContext = new TokenRequestContext([$"{_options.ClientId}/.default"]);
+                    var token = await _tokenCredential.GetTokenAsync(tokenRequestContext, cancellationToken).ConfigureAwait(false);
+                    return token.Token;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to acquire token using credential: {Message}", ex.Message);
+                }
+            }
+
             if (_msalApp != null)
             {
                 if (scopes.Count == 0)
@@ -256,7 +303,7 @@ namespace Azure.Sdk.Tools.Cli.Services
                     _logger.LogError("Failed to authenticate.");
                     throw new Exception("Failed to acquire authentication token after interactive authentication attempt.");
                 }
-                return authResult;
+                return authResult.AccessToken;
             }
             else
             {

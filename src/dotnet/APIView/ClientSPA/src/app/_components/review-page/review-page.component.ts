@@ -1,4 +1,4 @@
-import { ChangeDetectorRef, Component, Input, OnInit, OnDestroy, ViewChild } from '@angular/core';
+import { ChangeDetectionStrategy, ChangeDetectorRef, Component, Input, OnInit, OnDestroy, ViewChild } from '@angular/core';
 import { ActivatedRoute, Params, Router } from '@angular/router';
 import { Title } from '@angular/platform-browser';
 import { MenuItem, TreeNode } from 'primeng/api';
@@ -19,7 +19,7 @@ import { ACTIVE_API_REVISION_ID_QUERY_PARAM, DIFF_API_REVISION_ID_QUERY_PARAM, D
 import { CodePanelData, CodePanelRowData, CodePanelRowDatatype, CrossLanguageContentDto } from 'src/app/_models/codePanelModels';
 import { UserProfile } from 'src/app/_models/userProfile';
 import { ReviewPageWorkerMessageDirective } from 'src/app/_models/insertCodePanelRowDataMessage';
-import { CommentItemModel, CommentType, CommentSeverity, CommentSource } from 'src/app/_models/commentItemModel';
+import { CommentItemModel, CommentType } from 'src/app/_models/commentItemModel';
 import { SignalRService } from 'src/app/_services/signal-r/signal-r.service';
 import { SamplesRevisionService } from 'src/app/_services/samples/samples.service';
 import { SamplesRevision } from 'src/app/_models/samples';
@@ -35,7 +35,8 @@ import { PermissionsService } from 'src/app/_services/permissions/permissions.se
     selector: 'app-review-page',
     templateUrl: './review-page.component.html',
     styleUrls: ['./review-page.component.scss'],
-    standalone: false
+    standalone: false,
+    changeDetection: ChangeDetectionStrategy.OnPush
 })
 export class ReviewPageComponent implements OnInit, OnDestroy {
   @ViewChild(CodePanelComponent) codePanelComponent!: CodePanelComponent;
@@ -69,11 +70,19 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
   hasActiveConversation: boolean = false;
   codeLineSearchInfo: CodeLineSearchInfo | undefined;
   numberOfActiveConversation: number = 0;
+  activeView: 'reviews' | 'revisions' | 'samples' | 'conversations' | 'namespace' = 'reviews';
   hasHiddenAPIs: boolean = false;
   hasHiddenAPIThatIsDiff: boolean = false;
   loadFailed: boolean = false;
   loadFailedMessage: string = "API-Revision Content Load Failed...";
   loadingMessage: string | undefined = undefined;
+
+  samplesRevisionCount: number = 0;
+
+  // Lazy-once flags: components are created on first visit, then stay alive via [hidden]
+  revisionsActivated = false;
+  samplesActivated = false;
+  namespaceActivated = false;
 
   showLeftNavigation: boolean = true;
   showPageOptions: boolean = true;
@@ -84,8 +93,11 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
 
   codePanelData: CodePanelData | null = null;
   codePanelRowData: CodePanelRowData[] = [];
+  loadingStatus: 'loading' | 'completed' | 'failed' = 'loading';
   crossLanguageRowData: CrossLanguageContentDto[] = [];
-  apiRevisionPageSize = 200;
+
+  private codePanelIsLoading: boolean = true;
+  apiRevisionPageSize = 100;
   lastNodeIdUnhashedDiscarded = '';
 
   codeLineSearchText: string | undefined = undefined;
@@ -96,11 +108,22 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
 
   sideMenu: MenuItem[] | undefined;
 
+  get hasReleasedApprovedGARevision(): boolean {
+    return this.apiRevisions.some(rev =>
+      rev.id !== this.activeAPIRevision?.id &&
+      rev.isApproved &&
+      rev.isReleased &&
+      !!rev.packageVersion &&
+      !rev.packageVersion.includes('-')
+    );
+  }
+
   constructor(private route: ActivatedRoute, private router: Router, private apiRevisionsService: APIRevisionsService,
-    private reviewsService: ReviewsService, private workerService: WorkerService, private changeDetectorRef: ChangeDetectorRef,
+    private reviewsService: ReviewsService, private workerService: WorkerService,
     private userProfileService: UserProfileService, private commentsService: CommentsService, private signalRService: SignalRService,
     private samplesRevisionService: SamplesRevisionService, private titleService: Title, private notificationsService: NotificationsService,
-    private reviewContextService: ReviewContextService, private permissionsService: PermissionsService) { }
+    private reviewContextService: ReviewContextService, private permissionsService: PermissionsService,
+    private cdr: ChangeDetectorRef) { }
 
   ngOnInit() {
     this.reviewId = this.route.snapshot.paramMap.get(REVIEW_ID_ROUTE_PARAM);
@@ -121,6 +144,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
         if (this.userProfile?.preferences.hideLineNumbers) {
           this.showLineNumbers = false;
         }
+        this.cdr.markForCheck();
       });
     this.route.queryParams.pipe(takeUntil(this.destroy$)).subscribe(params => {
       const navigationState = this.router.currentNavigation()?.extras.state;
@@ -131,71 +155,46 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
 
     this.loadReview(this.reviewId!);
     this.loadAPIRevisions(0, this.apiRevisionPageSize);
-    this.loadComments();
     this.handleRealTimeReviewUpdates();
     this.handleRealTimeAPIRevisionUpdates();
     this.loadLatestSampleRevision(this.reviewId!);
+    this.loadSamplesCount(this.reviewId!);
   }
 
   createSideMenu() {
-    const menu: MenuItem[] = [
-      {
-        icon: 'bi bi-clock-history',
-        tooltip: 'Revisions',
-        command: () => {
-          if (this.getLoadingStatus() === 'completed') {
-            this.revisionSidePanel = !this.revisionSidePanel;
-          }
-        }
-      }
-    ];
+    const menu: MenuItem[] = [];
 
     if (this.activeAPIRevision?.files[0].crossLanguagePackageId && this.crossLanguageAPIRevisions.length > 0) {
       menu.push({
         icon: 'bi bi-arrow-left-right',
         tooltip: 'Cross Language',
         command: () => {
-          if (this.getLoadingStatus() === 'completed') {
+          if (this.loadingStatus === 'completed') {
             this.crosslanguageRevisionSidePanel = !this.crosslanguageRevisionSidePanel;
           }
         }
       });
     }
-    menu.push(...[
-      {
-        id: 'conversations',
-        icon: 'bi bi-chat-left-dots',
-        tooltip: (this.numberOfActiveConversation > 0) ? `Conversations (${this.numberOfActiveConversation} unresolved)` : 'Conversations',
-        badge: (this.numberOfActiveConversation > 0) ? this.numberOfActiveConversation.toString() : undefined,
-        command: () => {
-          if (this.getLoadingStatus() === 'completed') {
-            this.conversationSidePanel = !this.conversationSidePanel;
-          }
-        }
-      },
-      {
-        icon: 'bi bi-puzzle',
-        tooltip: 'Samples',
-        command: () => {
-          const queryParams: any = {};
-          if (this.latestSampleRevision) {
-            queryParams['activeSamplesRevisionId'] = this.latestSampleRevision?.id;
-          }
-          if (this.activeApiRevisionId) {
-            queryParams['activeApiRevisionId'] = this.activeApiRevisionId;
-          }
-          if (this.diffApiRevisionId) {
-            queryParams['diffApiRevisionId'] = this.diffApiRevisionId;
-          }
-          this.router.navigate(['/samples', this.reviewId], { queryParams: queryParams });
-        }
-      }
-    ]);
     this.sideMenu = menu;
-    this.changeDetectorRef.detectChanges();
   }
 
   updateStateBasedOnQueryParams(params: Params) {
+    const viewParam = params['view'];
+    if (viewParam === 'conversations') {
+      this.activeView = 'conversations';
+    } else if (viewParam === 'revisions') {
+      this.revisionsActivated = true;
+      this.activeView = 'revisions';
+    } else if (viewParam === 'samples') {
+      this.samplesActivated = true;
+      this.activeView = 'samples';
+    } else if (viewParam === 'namespace') {
+      this.namespaceActivated = true;
+      this.activeView = 'namespace';
+    } else {
+      this.activeView = 'reviews';
+    }
+
     this.activeApiRevisionId = params[ACTIVE_API_REVISION_ID_QUERY_PARAM];
     this.activeAPIRevision = this.apiRevisions.filter(x => x.id === this.activeApiRevisionId)[0];
     this.diffApiRevisionId = params[DIFF_API_REVISION_ID_QUERY_PARAM];
@@ -204,15 +203,25 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
     this.scrollToNodeId = params[SCROLL_TO_NODE_QUERY_PARAM];
     this.reviewPageNavigation = [];
     this.codePanelRowData = [];
+    this.codePanelIsLoading = true;
     this.codePanelData = null;
+    this.comments = [];
     this.loadFailed = false;
-    
-    // Set loading message if diagnostics need migration (old revisions without hash)
-    this.loadingMessage = (this.activeAPIRevision && !this.activeAPIRevision.diagnosticsHash)
-      ? 'Processing diagnostics...' 
-      : undefined;
-    
-    this.changeDetectorRef.detectChanges();
+    this.updateLoadingStatus();
+
+    // Clear the conversations badge immediately — the count will be inaccurate
+    // until the code panel finishes loading and diagnostics are synced.
+    this.numberOfActiveConversation = 0;
+    if (this.sideMenu) {
+      const conversationsItem = this.sideMenu.find(item => item.id === 'conversations');
+      if (conversationsItem) {
+        conversationsItem.badge = undefined;
+        conversationsItem.tooltip = 'Conversations';
+        this.sideMenu = [...this.sideMenu];
+      }
+    }
+
+    this.cdr.markForCheck();
     this.workerService.startWorker().then(() => {
       this.registerWorkerEventHandler();
       this.loadReviewContent(this.reviewId!, this.activeApiRevisionId, this.diffApiRevisionId);
@@ -246,6 +255,8 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
         this.workerService.terminateWorker();
         this.loadComments();
       }
+
+      this.cdr.markForCheck();
     });
   }
 
@@ -261,12 +272,16 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
             this.loadFailedMessage = "API-Revision Content Not Found. The";
             this.loadFailedMessage += (diffApiRevisionId) ? " active and/or diff API-Revision(s)" : " active API-Revision";
             this.loadFailedMessage += " may have been deleted.";
+            this.updateLoadingStatus();
+            this.cdr.markForCheck();
             return;
           } else if (response.status == 202) {
             const location = response.headers.get('location');
             this.loadFailed = true;
             this.loadFailedMessage = `API-Revision content is being generated at <a href="${location}">${location}</a></br>`
             this.loadFailedMessage += "Please refresh this page after few minutes to see generated API review.";
+            this.updateLoadingStatus();
+            this.cdr.markForCheck();
             return;
           }
           else {
@@ -284,6 +299,8 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
         },
         error: (error: any) => {
           this.loadFailed = true;
+          this.updateLoadingStatus();
+          this.cdr.markForCheck();
         }
       });
   }
@@ -293,6 +310,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
       .pipe(takeUntil(this.destroy$)).subscribe({
         next: (review: Review) => {
           this.review = review;
+          this.cdr.markForCheck();
           this.updateLoadingStateBasedOnReviewDeletionStatus();
           this.updatePageTitle();
           if (review.language) {
@@ -302,6 +320,8 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
         error: (error) => {
           this.loadFailed = true;
           this.loadFailedMessage = "Failed to load review. Please refresh the page or try again later.";
+          this.updateLoadingStatus();
+          this.cdr.markForCheck();
         }
       });
   }
@@ -333,6 +353,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
         takeUntil(this.destroyLoadAPIRevision$),
         concatMap((response: any) => {
           this.apiRevisions = response.result;
+          this.cdr.markForCheck();
           if (this.apiRevisions.length > 0) {
             this.language = this.apiRevisions[0].language;
             this.languageSafeName = getLanguageCssSafeName(this.language);
@@ -386,6 +407,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
       .pipe(takeUntil(this.destroy$)).subscribe({
         next: (comments: CommentItemModel[]) => {
           this.comments = comments;
+          this.cdr.markForCheck();
           CommentRelationHelper.calculateRelatedComments(this.comments);
           this.processEmbeddedComments();
         }
@@ -425,7 +447,6 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
         });
       }
     });
-    this.changeDetectorRef.detectChanges();
   }
 
   loadLatestSampleRevision(reviewId: string) {
@@ -437,11 +458,88 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
       });
   }
 
+  loadSamplesCount(reviewId: string) {
+    this.samplesRevisionService.getSamplesRevisions(0, 1, reviewId)
+      .pipe(takeUntil(this.destroy$)).subscribe({
+        next: (result) => {
+          this.samplesRevisionCount = result.pagination?.totalCount ?? 0;
+          this.cdr.markForCheck();
+        }
+      });
+  }
+
+  navigateToRevisions() {
+    this.revisionsActivated = true;
+    this.activeView = 'revisions';
+    const currentParams = getQueryParams(this.route);
+    this.router.navigate([], {
+      queryParams: { ...currentParams, view: 'revisions' },
+      state: { skipStateUpdate: true }
+    });
+  }
+
+  navigateToSamples() {
+    this.samplesActivated = true;
+    this.activeView = 'samples';
+    const currentParams = getQueryParams(this.route);
+    this.router.navigate([], {
+      queryParams: { ...currentParams, view: 'samples' },
+      state: { skipStateUpdate: true }
+    });
+  }
+
+  navigateToNamespace() {
+    this.namespaceActivated = true;
+    this.activeView = 'namespace';
+    const currentParams = getQueryParams(this.route);
+    this.router.navigate([], {
+      queryParams: { ...currentParams, view: 'namespace' },
+      state: { skipStateUpdate: true }
+    });
+  }
+
+  navigateToConversations() {
+    const queryParams: any = {};
+    if (this.activeApiRevisionId) {
+      queryParams['activeApiRevisionId'] = this.activeApiRevisionId;
+    }
+    this.router.navigate(['/conversation', this.reviewId], { queryParams: queryParams });
+  }
+
+  showConversationsView() {
+    this.activeView = 'conversations';
+    const currentParams = getQueryParams(this.route);
+    this.router.navigate([], {
+      queryParams: { ...currentParams, view: 'conversations' },
+      state: { skipStateUpdate: true }
+    });
+  }
+
+  showReviewView() {
+    this.activeView = 'reviews';
+    const currentParams = getQueryParams(this.route, ['nId', 'view']);
+    this.router.navigate([], {
+      queryParams: currentParams,
+      state: { skipStateUpdate: true }
+    });
+  }
+
+  handleConversationScrollToNode(elementId: string) {
+    this.activeView = 'reviews';
+    setTimeout(() => {
+      this.codePanelComponent.scrollToNode(undefined, elementId);
+    }, 100);
+    this.cdr.markForCheck();
+  }
+
   handlePageOptionsEmitter(showPageOptions: boolean) {
     this.userProfile!.preferences.hideReviewPageOptions = !showPageOptions;
+    this.showPageOptions = showPageOptions;
+    this.cdr.markForCheck();
     this.userProfileService.updateUserPrefernece(this.userProfile!.preferences).pipe(takeUntil(this.destroy$)).subscribe({
       next: () => {
         this.updateRightPanelSize();
+        this.cdr.markForCheck();
       }
     });
   }
@@ -463,6 +561,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
         else {
           this.codePanelComponent?.removeRowTypeFromScroller(CodePanelRowDatatype.CommentThread);
         }
+        this.cdr.markForCheck();
       }
     });
   }
@@ -473,10 +572,12 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
     this.userProfileService.updateUserPrefernece(userPreferenceModel!).pipe(takeUntil(this.destroy$)).subscribe({
       next: () => {
         if (userPreferenceModel!.showSystemComments) {
-          this.codePanelComponent?.insertDiagnosticCommentThreads();
-        } else {
-          this.codePanelComponent?.removeDiagnosticCommentThreads();
+          this.codePanelComponent?.insertRowTypeIntoScroller(CodePanelRowDatatype.Diagnostics);
         }
+        else {
+          this.codePanelComponent?.removeRowTypeFromScroller(CodePanelRowDatatype.Diagnostics);
+        }
+        this.cdr.markForCheck();
       }
     });
   }
@@ -492,6 +593,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
         else {
           this.codePanelComponent?.removeRowTypeFromScroller(CodePanelRowDatatype.Documentation);
         }
+        this.cdr.markForCheck();
       }
     });
   }
@@ -501,6 +603,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
     this.userProfileService.updateUserPrefernece(this.userProfile!.preferences).pipe(takeUntil(this.destroy$)).subscribe({
       next: () => {
         this.updateLeftPanelSize();
+        this.cdr.markForCheck();
       }
     });
   }
@@ -534,25 +637,18 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
   }
 
   handleSplitterResizeEnd(event: any) {
-    if (event.sizes[0] > 5) {
-      this.userProfile!.preferences.hideLeftNavigation = false;
-    } else {
-      this.userProfile!.preferences.hideLeftNavigation = true;
-      this.updateLeftPanelSize();
-    }
+    this.panelSizes = [...event.sizes];
 
-    if (event.sizes[2] > 5) {
-      this.userProfile!.preferences.hideReviewPageOptions = false;
-    } else {
-      this.userProfile!.preferences.hideReviewPageOptions = true;
-      this.updateRightPanelSize();
-    }
+    const hideLeft = event.sizes[0] <= 5;
+    const hideRight = event.sizes[2] <= 5;
+    this.userProfile!.preferences.hideLeftNavigation = hideLeft;
+    this.userProfile!.preferences.hideReviewPageOptions = hideRight;
+    this.showLeftNavigation = !hideLeft;
+    this.showPageOptions = !hideRight;
+
     this.userProfileService.updateUserPrefernece(this.userProfile!.preferences).pipe(takeUntil(this.destroy$)).subscribe({
       next: () => {
-        this.showLeftNavigation = !this.userProfile!.preferences.hideLeftNavigation;
-        this.showPageOptions = !this.userProfile!.preferences.hideReviewPageOptions;
-
-        // need this to trigger change detection
+        // Create a new reference so Angular propagates the updated preferences to child inputs.
         const userProfile: UserProfile = {
           userName: this.userProfile!.userName,
           email: this.userProfile!.email,
@@ -561,6 +657,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
           permissions: this.userProfile!.permissions
         };
         this.userProfile = userProfile;
+        this.cdr.markForCheck();
       }
     });
   }
@@ -570,6 +667,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
     userPreferenceModel!.hideLineNumbers = !state;
     this.userProfileService.updateUserPrefernece(userPreferenceModel!).pipe(takeUntil(this.destroy$)).subscribe(() => {
       this.showLineNumbers = !userPreferenceModel!.hideLineNumbers;
+      this.cdr.markForCheck();
     });
   }
 
@@ -589,6 +687,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
           this.activeAPIRevision = apiRevision;
           const activeAPIRevisionIndex = this.apiRevisions.findIndex(x => x.id === this.activeAPIRevision!.id);
           this.apiRevisions[activeAPIRevisionIndex] = this.activeAPIRevision!;
+          this.cdr.markForCheck();
         }
       });
     }
@@ -599,6 +698,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
       this.reviewsService.toggleReviewApproval(this.reviewId!, this.activeApiRevisionId!, true).pipe(take(1)).subscribe({
         next: (review: Review) => {
           this.review = review;
+          this.cdr.markForCheck();
         }
       });
     }
@@ -609,6 +709,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
       this.reviewsService.requestNamespaceReview(this.reviewId!, this.activeApiRevisionId!).pipe(take(1)).subscribe({
         next: (review: Review) => {
           this.review = review;
+          this.cdr.markForCheck();
           // Reset loading state in the options component on success
           if (this.reviewPageOptionsComponent) {
             this.reviewPageOptionsComponent.resetNamespaceReviewLoadingState();
@@ -680,34 +781,34 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
     this.hasActiveConversation = value;
   }
 
+  handleCodePanelIsLoadingChanged(isLoading: boolean) {
+    this.codePanelIsLoading = isLoading;
+    this.updateLoadingStatus();
+  }
+
   handleCodeLineSearchInfoEmitter(value: CodeLineSearchInfo) {
     setTimeout(() => {
       this.codeLineSearchInfo = (value) ? new CodeLineSearchInfo(value.currentMatch, value.totalMatchCount) : undefined;
+      this.cdr.markForCheck();
     }, 0);
   }
 
   handleNumberOfActiveThreadsEmitter(value: number) {
-    this.numberOfActiveConversation = value;
-    if (this.sideMenu) {
-      const conversationsItem = this.sideMenu.find(item => item.id === 'conversations');
-      if (conversationsItem) {
-        conversationsItem.badge = (value > 0) ? value.toString() : undefined;
-        conversationsItem.tooltip = (value > 0) ? `Conversations (${value} unresolved)` : 'Conversations';
-        this.sideMenu = [...this.sideMenu];
-        this.changeDetectorRef.detectChanges();
-      }
-    } else {
-      this.createSideMenu();
+    // Suppress the badge until the code panel has loaded. Before that point,
+    // diagnostics may not be synced yet so the count would be inaccurate.
+    if (!this.codePanelData) {
+      return;
     }
+    this.numberOfActiveConversation = value;
+    this.cdr.markForCheck();
   }
 
   handleScrollToNodeEmitter(value: string) {
-    this.conversationSidePanel = false;
     this.codePanelComponent.scrollToNode(undefined, value);
   }
 
   handleDismissSidebarAndNavigate(event: { revisionId: string, elementId: string }) {
-    this.conversationSidePanel = false;
+    this.activeView = 'reviews';
     const currentParams = getQueryParams(this.route);
     this.router.navigate(['/review', this.reviewId], {
       queryParams: {
@@ -723,6 +824,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
       next: (updatedReview: Review) => {
         if (updatedReview.id === this.reviewId) {
           this.review = updatedReview;
+          this.cdr.markForCheck();
         }
       }
     });
@@ -740,6 +842,7 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
           if (updatedAPIRevision.id === this.activeApiRevisionId) {
             this.activeAPIRevision = updatedAPIRevision;
           }
+          this.cdr.markForCheck();
         }
       }
     });
@@ -760,41 +863,35 @@ export class ReviewPageComponent implements OnInit, OnDestroy {
         });
         cldto.push(response)
         this.crossLanguageRowData = cldto;
+        this.cdr.markForCheck();
       });
   }
 
-  getLoadingStatus(): 'loading' | 'completed' | 'failed' {
-    if (this.codePanelComponent?.isLoading) {
-      return 'loading';
-    }
-    else {
-      return (this.loadFailed) ? 'failed' : 'completed';
+  private updateLoadingStatus() {
+    if (this.loadFailed) {
+      this.loadingStatus = 'failed';
+    } else if (this.codePanelIsLoading) {
+      this.loadingStatus = 'loading';
+    } else {
+      this.loadingStatus = 'completed';
     }
   }
 
   checkForFatalDiagnostics() {
     for (const rowData of this.codePanelRowData) {
-      // Check legacy diagnostic rows
       if (rowData.diagnostics && rowData.diagnostics.level === 'fatal') {
         this.hasFatalDiagnostics = true;
-        break;
-      }
-      if (rowData.comments) {
-        for (const comment of rowData.comments) {
-          if (comment.commentSource === CommentSource.Diagnostic && comment.severity === CommentSeverity.MustFix) {
-            this.hasFatalDiagnostics = true;
-            break;
-          }
-        }
-        if (this.hasFatalDiagnostics) break;
+        return;
       }
     }
+    this.hasFatalDiagnostics = false;
   }
 
   updateLoadingStateBasedOnReviewDeletionStatus(): boolean {
     if (this.review?.isDeleted) {
       this.loadFailed = true;
       this.loadFailedMessage = "Review has been deleted.";
+      this.updateLoadingStatus();
       return true;
     }
     return false;

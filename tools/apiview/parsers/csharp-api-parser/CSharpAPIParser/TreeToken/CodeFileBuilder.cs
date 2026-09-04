@@ -3,7 +3,8 @@
 
 using System.Collections.Immutable;
 using System.ComponentModel;
-using ApiView;
+using APIView;
+using APIView.CSharp;
 using APIView.Analysis;
 using APIView.Model.V2;
 using Microsoft.CodeAnalysis;
@@ -47,7 +48,7 @@ namespace CSharpAPIParser.TreeToken
 
         public ICodeFileBuilderSymbolOrderProvider SymbolOrderProvider { get; set; } = new CodeFileBuilderSymbolOrderProvider();
 
-        public const string CurrentVersion = "29.9";
+        public const string CurrentVersion = "29.91";
 
         private IEnumerable<INamespaceSymbol> EnumerateNamespaces(IAssemblySymbol assemblySymbol)
         {

@@ -12,7 +12,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using ApiView;
+using APIView;
 using APIViewWeb.Helpers;
 using APIViewWeb.Hubs;
 using APIViewWeb.LeanModels;
@@ -224,35 +224,45 @@ namespace APIViewWeb.Managers
         /// <param name="language"></param>
         /// <param name="runAnalysis"></param>
         /// <returns></returns>
-        public async Task<ReviewListItemModel> GetOrCreateReview(IFormFile file, string filePath, string language, bool runAnalysis = false)
+        public async Task<(ReviewListItemModel Review, CodeFile CodeFile, MemoryStream MemoryStream)> GetOrCreateReview(IFormFile file, string filePath, string language, bool runAnalysis = false)
         {
             CodeFile codeFile = null;
             ReviewListItemModel review = null;
 
-            using var memoryStream = new MemoryStream();
-            if (file != null)
+            // MemoryStream lifecycle is owned by the caller so pre-parsed data can be reused.
+            // Dispose on failure to avoid leaking the stream when the caller never receives it.
+            var memoryStream = new MemoryStream();
+            try
             {
-                using (var openReadStream = file.OpenReadStream())
+                if (file != null)
+                {
+                    using (var openReadStream = file.OpenReadStream())
+                    {
+                        codeFile = await _codeFileManager.CreateCodeFileAsync(
+                            originalName: file?.FileName, fileStream: openReadStream, runAnalysis: runAnalysis, memoryStream: memoryStream, language: language);
+                    }
+                }
+                else if (!string.IsNullOrEmpty(filePath))
                 {
                     codeFile = await _codeFileManager.CreateCodeFileAsync(
-                        originalName: file?.FileName, fileStream: openReadStream, runAnalysis: runAnalysis, memoryStream: memoryStream, language: language);
+                        originalName: filePath, runAnalysis: runAnalysis, memoryStream: memoryStream, language: language);
                 }
-            }
-            else if (!string.IsNullOrEmpty(filePath))
-            {
-                codeFile = await _codeFileManager.CreateCodeFileAsync(
-                    originalName: filePath, runAnalysis: runAnalysis, memoryStream: memoryStream, language: language);
-            }
 
-            if (codeFile != null)
-            {
-                review = await GetReviewAsync(packageName: codeFile.PackageName, language: codeFile.Language);
-                if (review == null)
+                if (codeFile != null)
                 {
-                    review = await CreateReviewAsync(packageName: codeFile.PackageName, language: codeFile.Language, isClosed: false, crossLanguagePackageId: codeFile.CrossLanguagePackageId);
+                    review = await GetReviewAsync(packageName: codeFile.PackageName, language: codeFile.Language);
+                    if (review == null)
+                    {
+                        review = await CreateReviewAsync(packageName: codeFile.PackageName, language: codeFile.Language, isClosed: false, crossLanguagePackageId: codeFile.CrossLanguagePackageId);
+                    }
                 }
+                return (review, codeFile, memoryStream);
             }
-            return review;
+            catch
+            {
+                memoryStream.Dispose();
+                throw;
+            }
         }
 
         /// <summary>
@@ -372,26 +382,16 @@ namespace APIViewWeb.Managers
             ReviewListItemModel review = await _reviewsRepository.GetReviewAsync(id);
             var userId = user.GetGitHubLogin();
             var updatedReview = await ToggleReviewApproval(user, review, notes);
-            await _signalRHubContext.Clients.Group(userId).SendAsync("ReceiveApprovalSelf", id, revisionId, review.IsApproved);
-            await _signalRHubContext.Clients.All.SendAsync("ReceiveApproval", id, revisionId, userId, review.IsApproved);
-            return updatedReview;
-        }
+            await _signalRHubContext.Clients.Group(userId).SendAsync("ReceiveApprovalSelf", id, revisionId, updatedReview.IsApproved);
+            await _signalRHubContext.Clients.All.SendAsync("ReceiveApproval", id, revisionId, userId, updatedReview.IsApproved);
 
-        /// <summary>
-        /// ApproveReviewAsync
-        /// </summary>
-        /// <param name="user"></param>
-        /// <param name="reviewId"></param>
-        /// <param name="notes"></param>
-        /// <returns></returns>
-        public async Task ApproveReviewAsync(ClaimsPrincipal user, string reviewId, string notes = "")
-        {
-            ReviewListItemModel review = await _reviewsRepository.GetReviewAsync(reviewId);
-            if (review.IsApproved)
+            if (updatedReview.IsApproved)
             {
-                return;
+                var apiRevision = await _apiRevisionsRepository.GetAPIRevisionAsync(revisionId);
+                await _notificationManager.NotifySubscribersOnApprovalAsync(updatedReview, apiRevision, user, isReviewApproval: true);
             }
-            await ToggleReviewApproval(user, review);
+
+            return updatedReview;
         }
 
         /// <summary>
@@ -432,8 +432,9 @@ namespace APIViewWeb.Managers
             // Update the reviews identified by review IDs with namespace approval fields
             await MarkAssociatedReviewsForNamespaceReview(relatedReviews, userId, requestedOn, reviewGroupId);
 
-            // Send email notifications to preferred approvers with the actual language review data
-            await _notificationManager.NotifyApproversOnNamespaceReviewRequest(user, typeSpecReview, sdkLanguageReviews);            return typeSpecReview;
+            // Send email notifications to language approvers (resolved via permissions) with the actual language review data
+            await _notificationManager.NotifyNamespaceReviewRequestRecipientsAsync(user, typeSpecReview, sdkLanguageReviews);
+            return typeSpecReview;
         }
 
         /// <summary>
@@ -593,9 +594,7 @@ namespace APIViewWeb.Managers
                 _logger.LogInformation("Copilot job started successfully. JobId: {JobId}, ReviewId: {ReviewId}, APIRevisionId: {APIRevisionId}", 
                     jobStartedResponse.JobId, reviewId, activeApiRevision.Id);
                 
-                activeApiRevision.CopilotReviewJobId = jobStartedResponse.JobId;
-                activeApiRevision.CopilotReviewInProgress = true;
-                await _apiRevisionsManager.UpdateAPIRevisionAsync(activeApiRevision);
+                await _apiRevisionsManager.UpdateAPIRevisionCopilotDetailsAsync(activeApiRevision, copilotReviewInProgress: true, copilotReviewJobId: jobStartedResponse.JobId);
                 _pollingJobQueueManager.Enqueue(new AIReviewJobInfoModel()
                 {
                     JobId = jobStartedResponse.JobId,
@@ -608,14 +607,164 @@ namespace APIViewWeb.Managers
                 _logger.LogError(e, "Failed to start Copilot job for ReviewId: {ReviewId}, APIRevisionId: {APIRevisionId}", 
                     reviewId, activeApiRevision.Id);
                 
-                activeApiRevision.CopilotReviewInProgress = false;
-                await _apiRevisionsManager.UpdateAPIRevisionAsync(activeApiRevision);
+                await _apiRevisionsManager.UpdateAPIRevisionCopilotDetailsAsync(activeApiRevision, copilotReviewInProgress: false);
                 throw new Exception($"Copilot Failed: {e.Message}");
             }
         }
 
         /// <summary>
-        /// Logic to update Reviews in a blackground task
+        /// Start an AVC review job by sending raw API text to the copilot service.
+        /// </summary>
+        public async Task<AIReviewJobStartedResponseModel> StartCopilotReviewJobAsync(StartReviewJobRequest request)
+        {
+            if (string.IsNullOrEmpty(request.Target))
+            {
+                throw new ArgumentException("Target API text is required.", nameof(request));
+            }
+
+            (string strippedTarget, string inferredLanguage) = StripMarkdownCodeBlock(request.Target);
+
+            string language = string.IsNullOrEmpty(request.Language)
+                ? inferredLanguage
+                : request.Language;
+
+            if (string.IsNullOrEmpty(language))
+            {
+                throw new ArgumentException("Language is required and could not be inferred from the input.",
+                    nameof(request));
+            }
+
+            language = LanguageServiceHelpers.GetLanguageAliasForCopilotService(language);
+
+            string copilotEndpoint = _configuration["CopilotServiceEndpoint"];
+            string startUrl = $"{copilotEndpoint}/api-review/start";
+            HttpClient client = _httpClientFactory.CreateClient();
+
+            var payload = new Dictionary<string, object> { { "target", strippedTarget }, { "language", language } };
+
+            if (!string.IsNullOrEmpty(request.Base))
+            {
+                (string strippedBase, _) = StripMarkdownCodeBlock(request.Base);
+                payload["base"] = strippedBase;
+            }
+
+            if (!string.IsNullOrEmpty(request.Outline))
+            {
+                payload["outline"] = request.Outline;
+            }
+
+            if (request.ExistingComments is { Count: > 0 })
+            {
+                payload["comments"] = request.ExistingComments;
+            }
+
+            try
+            {
+                _logger.LogInformation("Starting AVC review job via API. Language: {Language}", language);
+
+                using var httpRequest = new HttpRequestMessage(HttpMethod.Post, startUrl)
+                {
+                    Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+                };
+                httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", await _copilotAuthService.GetAccessTokenAsync());
+
+                using HttpResponseMessage response = await client.SendAsync(httpRequest);
+                string responseString = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.LogError("Copilot service returned {StatusCode}: {ErrorBody}", response.StatusCode, responseString);
+                    throw new HttpRequestException($"Copilot service returned {(int)response.StatusCode}: {responseString}", null, response.StatusCode);
+                }
+
+                AIReviewJobStartedResponseModel jobStartedResponse = JsonSerializer.Deserialize<AIReviewJobStartedResponseModel>(responseString);
+                
+                _logger.LogInformation("AVC review job started successfully. JobId: {JobId}", jobStartedResponse.JobId);
+                return jobStartedResponse;
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Failed to start AVC review job via API");
+                throw;
+            }
+        }
+
+        /// <summary>
+        ///     Get the status/result of an AVC review job by polling the copilot service.
+        /// </summary>
+        public async Task<AIReviewJobPolledResponseModel> GetCopilotReviewJobAsync(string jobId)
+        {
+            if (string.IsNullOrEmpty(jobId))
+            {
+                throw new ArgumentException("Job ID is required.", nameof(jobId));
+            }
+
+            string copilotEndpoint = _configuration["CopilotServiceEndpoint"];
+            string pollUrl = $"{copilotEndpoint}/api-review/{jobId}";
+            HttpClient client = _httpClientFactory.CreateClient();
+
+            try
+            {
+                _logger.LogInformation("Polling AVC review job status. JobId: {JobId}", jobId);
+
+                using var request = new HttpRequestMessage(HttpMethod.Get, pollUrl);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", await _copilotAuthService.GetAccessTokenAsync());
+
+                HttpResponseMessage response = await client.SendAsync(request);
+                response.EnsureSuccessStatusCode();
+                string responseString = await response.Content.ReadAsStringAsync();
+                return JsonSerializer.Deserialize<AIReviewJobPolledResponseModel>(responseString);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Failed to get AVC review job status. JobId: {JobId}", jobId);
+                throw;
+            }
+        }
+
+        private static (string content, string language) StripMarkdownCodeBlock(string input)
+        {
+            if (string.IsNullOrEmpty(input))
+            {
+                return (input, null);
+            }
+
+            string trimmed = input.Trim();
+            if (!trimmed.StartsWith("```"))
+            {
+                return (input, null);
+            }
+
+            int firstNewline = trimmed.IndexOf('\n');
+            string tag;
+            string body;
+
+            if (firstNewline < 0)
+            {
+                tag = trimmed[3..].Trim();
+                body = string.Empty;
+            }
+            else
+            {
+                tag = trimmed[3..firstNewline].Trim();
+                body = trimmed[(firstNewline + 1)..];
+            }
+
+            if (body.TrimEnd().EndsWith("```"))
+            {
+                int lastFence = body.LastIndexOf("```");
+                body = body[..lastFence].TrimEnd();
+            }
+
+            string language = !string.IsNullOrEmpty(tag)
+                ? LanguageServiceHelpers.GetLanguageAliasForCopilotService(tag)
+                : null;
+
+            return (body, language);
+        }
+
+        /// <summary>
+        /// Logic to update Reviews in a background task
         /// </summary>
         /// <param name="updateDisabledLanguages"></param>
         /// <param name="backgroundBatchProcessCount"></param>
@@ -654,27 +803,29 @@ namespace APIViewWeb.Managers
                     foreach (var review in reviews)
                     {
                         var revisions = await _apiRevisionsManager.GetAPIRevisionsAsync(review.Id);
-                        foreach (var revision in revisions)
+                        foreach (var revision in revisions.Where(r => !r.IsDeleted))
                         {
-                            if (
-                                revision.Files.First().HasOriginal &&
-                                LanguageServiceHelpers.GetLanguageService(revision.Language, _languageServices)?.CanUpdate(revision.Files.First().VersionString) == true)
+                            APICodeFileModel firstFile = revision.Files.First();
+                            if (!firstFile.HasOriginal || LanguageServiceHelpers.GetLanguageService(revision.Language, _languageServices)
+                                    ?.CanUpdate(firstFile.VersionString) != true)
                             {
-                                var requestTelemetry = new RequestTelemetry { Name = $"Updating {review.Language} Review with id: {review.Id}"  };
-                                var operation = _telemetryClient.StartOperation(requestTelemetry);
-                                try
-                                {
-                                    await Task.Delay(100);
-                                    await _apiRevisionsManager.UpdateAPIRevisionAsync(revision, languageService, verifyUpgradabilityOnly);
-                                }
-                                catch (Exception e)
-                                {
-                                    _telemetryClient.TrackException(e);
-                                }
-                                finally
-                                {
-                                    _telemetryClient.StopOperation(operation);
-                                }
+                                continue;
+                            }
+
+                            var requestTelemetry = new RequestTelemetry { Name = $"Updating {review.Language} Review with id: {review.Id}"  };
+                            var operation = _telemetryClient.StartOperation(requestTelemetry);
+                            try
+                            {
+                                await Task.Delay(100);
+                                await _apiRevisionsManager.UpdateAPIRevisionAsync(revision, languageService, verifyUpgradabilityOnly);
+                            }
+                            catch (Exception e)
+                            {
+                                _telemetryClient.TrackException(e);
+                            }
+                            finally
+                            {
+                                _telemetryClient.StopOperation(operation);
                             }
                         }
                     }
@@ -752,7 +903,7 @@ namespace APIViewWeb.Managers
                                !r.IsDeleted && 
                                !r.IsApproved).ToList();
 
-                var typeSpecReview = allReviews.FirstOrDefault(r => 
+                var typeSpecReview = allReviews.FirstOrDefault(r =>
                     r.NamespaceReviewStatus == NamespaceReviewStatus.Pending &&
                     r.Language == ApiViewConstants.TypeSpecLanguage &&
                     !r.IsDeleted);
@@ -765,7 +916,7 @@ namespace APIViewWeb.Managers
                 await _reviewsRepository.UpsertReviewAsync(typeSpecReview);
 
                 // Send notification emails
-                await _notificationManager.NotifyStakeholdersOfManualApproval(typeSpecReview, allReviews);
+                await _notificationManager.NotifyStakeholdersOfManualApprovalAsync(typeSpecReview, allReviews);
             }
             catch (Exception ex)
             {
@@ -793,7 +944,7 @@ namespace APIViewWeb.Managers
                     try
                     {
                         var revisions = await _apiRevisionsManager.GetAPIRevisionsAsync(review.Id);
-                        foreach (var revision in revisions)
+                        foreach (var revision in revisions.Where(r => !r.IsDeleted))
                         {
                             foreach (var file in revision.Files)
                             {

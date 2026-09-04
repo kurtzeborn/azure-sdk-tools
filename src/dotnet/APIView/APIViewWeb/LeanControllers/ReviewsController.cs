@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using ApiView;
+using APIView;
 using APIViewWeb.Extensions;
 using APIViewWeb.Helpers;
 using APIViewWeb.Hubs;
@@ -116,15 +116,21 @@ namespace APIViewWeb.LeanControllers
         [HttpPost(Name = "CreateReview")]
         public async Task<ActionResult<APIRevisionListItemModel>> CreateReviewAsync([FromForm] ReviewCreationParam reviewCreationParam)
         {
-            var review = await _reviewManager.GetOrCreateReview(file: reviewCreationParam.File, filePath: reviewCreationParam.FilePath, language: reviewCreationParam.Language);
+            var (review, codeFile, memoryStream) = await _reviewManager.GetOrCreateReview(file: reviewCreationParam.File, filePath: reviewCreationParam.FilePath, language: reviewCreationParam.Language);
 
-            if (review != null)
+            using (memoryStream)
             {
-                APIRevisionListItemModel apiRevision = await _apiRevisionsManager.CreateAPIRevisionAsync(user: User, review: review, file: reviewCreationParam.File, 
-                    filePath: reviewCreationParam.FilePath, language: reviewCreationParam.Language, label: reviewCreationParam.Label);
-                return new LeanJsonResult(apiRevision, StatusCodes.Status201Created);
+                if (review != null)
+                {
+                    APIRevisionListItemModel apiRevision = await _apiRevisionsManager.CreateAPIRevisionAsync(
+                        user: User, review: review, file: reviewCreationParam.File,
+                        filePath: reviewCreationParam.FilePath, language: reviewCreationParam.Language,
+                        label: reviewCreationParam.Label,
+                        preParsedCodeFile: codeFile, preParsedMemoryStream: memoryStream);
+                    return new LeanJsonResult(apiRevision, StatusCodes.Status201Created);
+                }
+                return StatusCode(StatusCodes.Status500InternalServerError);
             }
-            return StatusCode(StatusCodes.Status500InternalServerError);
         }
 
         /// <summary>
@@ -253,19 +259,8 @@ namespace APIViewWeb.LeanControllers
                     return new LeanJsonResult("Content generation in progress", StatusCodes.Status202Accepted, languageServices.ReviewGenerationPipelineUrl);
                 }
 
-                IEnumerable<CommentItemModel> allCommentsFromDb = await _commentsManager.GetCommentsAsync(reviewId, commentType: CommentType.APIRevision);
-                List<CommentItemModel> diagnosticComments = await _commentsManager.SyncDiagnosticCommentsAsync(
-                    activeAPIRevision,
-                    activeRevisionReviewCodeFile.Diagnostics,
-                    allCommentsFromDb);
-
-                // Combine non-diagnostic comments with synced diagnostic comments
-                List<CommentItemModel> allComments = allCommentsFromDb
-                    .Where(c => c.CommentSource != CommentSource.Diagnostic)
-                    .Concat(diagnosticComments)
-                    .ToList();
-
-                List<CommentItemModel> filteredComments = allComments.Where(c => !c.IsResolved || c.APIRevisionId == activeApiRevisionId).ToList();
+                IEnumerable<CommentItemModel> comments = await _commentsManager.GetCommentsAsync(reviewId, commentType: CommentType.APIRevision);
+                List<CommentItemModel> filteredComments = comments.Where(c => !c.IsResolved || c.APIRevisionId == activeApiRevisionId).ToList();
                 var codePanelRawData = new CodePanelRawData()
                 {
                     activeRevisionCodeFile = activeRevisionReviewCodeFile,

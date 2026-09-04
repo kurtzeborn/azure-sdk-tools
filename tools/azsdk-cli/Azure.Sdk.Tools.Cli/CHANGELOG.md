@@ -1,5 +1,472 @@
 # Release History
 
+## 0.6.44 (Unreleased)
+
+### Features Added
+
+### Breaking Changes
+
+### Bugs Fixed
+
+### Other Changes
+
+## 0.6.43 (2026-09-03)
+
+### Breaking Changes
+
+- Moved `product-onboarding sync` CLI command to become `release-plan onboard-product`.
+
+## 0.6.42 (2026-09-01)
+
+### Bugs Fixed
+
+- `azsdk_run_generate_sdk` now blocks stable SDK generation for preview API versions.
+
+### Other Changes
+
+- Skip SDK generation if an SDK generation pipeline is already in progress for the release plan.
+- Do not run SDK generation if another release plan is in progress for the same package.
+
+## 0.6.41 (2026-08-31)
+
+### Features Added
+
+- Updated the `eng evaluate` CLI command to remove the Copilot SDK judge and add `--until` (an ISO-8601 timestamp) to control the evaluation window end time.
+
+## 0.6.40 (2026-08-31)
+
+### Bugs Fixed
+
+- `azsdk_run_generate_sdk` now blocks SDK generation for a spec pull request until that pull request is merged, so SDK pull requests are no longer created — and surfaced to reviewers — while the release plan is still in the API Spec Review stage.
+- Ignore API version associated with unknown language emitter configuration in metadata output.
+- Ignore unsupported languages when updating the languages in release plan.
+
+## 0.6.39 (2026-08-31)
+
+### Features Added
+
+- Create release plan tool parses TypeSpec project using metadata emitter to get API version and update it in release plan.
+
+### Breaking Changes
+
+- Removed the option to force create a release plan to avoid duplicate release plan.
+
+## 0.6.38 (2026-08-26)
+
+### Features Added
+
+- `package mark-released` output now includes the API Review Hub approval record ID and applied inheritance rule.
+- `package get-approval-status` output now includes IDs for API Review Hub approval records.
+
+## 0.6.37 (2026-08-21)
+
+### Features Added
+
+- Added `product-onboarding sync` CLI command to create or update product onboarding work items.
+
+### Bugs Fixed
+
+- `package mark-released` now skips API Review Hub when `--api-hash` is omitted and succeeds when either API Review Hub or APIView succeeds, failing only when neither backend succeeds.
+
+## 0.6.36 (2026-08-19)
+
+### Features Added
+
+- Added `eng evaluate` CLI command to evaluate whether Copilot's fixes for failing pipelines took the pipeline from failure to success and survived into the merged pull request. Accepts a repository owner and name. Optional parameters: `--since-days`, `--model`.
+
+## 0.6.35 (2026-08-14)
+
+### Features Added
+
+- Added the CLI-only `package mark-released` command to mark released packages independently in API Review Hub and APIView.
+
+### Breaking Changes
+
+- Moved `api-review get-approval-status` to `package get-approval-status` and renamed its MCP tool from `azsdk_apireview_get_approval_status` to `azsdk_package_get_approval_status`.
+- Removed the unused `apiview create-ci-revision` and `apiview create-pull-request-revision` commands.
+
+## 0.6.34 (2026-08-07)
+
+### Features Added
+
+- Added optional `--repo-owner` support to `api-review get-approval-status` (and `azsdk_apireview_get_approval_status`) so approval checks can target a specific repository owner when needed.
+
+### Bugs Fixed
+
+- `api-review create` now surfaces an already-existing API Review Hub review PR as a success rather than an error.
+- `api-review create` no longer requires `--base-tag`; when omitted, API Review Hub will construct an "all-green" review.
+
+## 0.6.33 (2026-07-29)
+
+### Features Added
+
+- Create release plan tool parses TypeSpec project using metadata emitter to get API version and update it in the release plan.
+
+### Breaking Changes
+- Added `AZSDK_COPILOT_GITHUB_TOKEN` support for authenticating Copilot-backed commands in non-interactive environments.
+
+### Bugs Fixed
+
+- Removed the unavailable `claude-sonnet-4.5` default from Copilot-backed commands.
+
+- Removed the option to force-create a release plan to avoid duplicate release plans.
+
+## 0.6.32 (2026-07-28)
+
+### Features Added
+
+- Added `api-review create` CLI command and `azsdk_apireviewhub_request_review_pr` MCP tool to request creation of an API Review Hub review pull request for a package API change. Accepts language, package name, base tag, target owner, target repo, and target branch parameters.
+- Added `api-review get-approval-status` CLI command and `azsdk_apireview_get_approval_status` MCP tool to check API review release approval status using APIView and API Review Hub services. Accepts language, package name, package version, and optional API hash parameters.
+
+### Breaking Changes
+
+- Removed `package get-work-item` CLI command - the intended use case is no longer relevant.
+- Removed `package update-work-item` CLI command - the intended use case is no longer relevant.
+
+## 0.6.31 (2026-07-27)
+
+### Features Added
+
+- `azp analyze` and `azsdk_analyze_pipeline` now also report the failed GitHub Actions runs for the commit under analysis (`github_workflow_analyses`, with the error lines extracted from each failed step's logs) and every check GitHub reports as red on the pull request (`failing_pull_request_checks`), so a pull request that is only failing outside Azure Pipelines is no longer reported as having nothing to analyze.
+- `azp analyze` and `azsdk_analyze_pipeline` flag a build that is still running, so partial results are not mistaken for a clean run.
+- `azsdk_get_pipeline_status` accepts the pipeline project, matching the `--project` option the command already exposed.
+- Added `detect-breaking-change` CLI command and `azsdk_package_detect_breaking_change` MCP tool to detect SDK breaking changes for a package. Accepts the sdk package via `--package-path`. Optional parameters: `--tsp-config-path`, `--changes-only`.
+- `codeowners add-label-owner` rejects a package-directory path (e.g. `sdk/<service>/<package>`) in favor of the package name; use `--force` to override, and wildcard (`*`) paths are always allowed.
+
+### Bugs Fixed
+
+- Public Azure Pipelines runs and public GitHub repositories are now read anonymously, so analyzing a public build or pull request no longer prompts for an Azure or GitHub CLI sign-in it does not need.
+- Pipeline analysis failures now return next steps that match the failure (a malformed identifier, a run or pull request that does not exist, or an access error) instead of always advising an Azure CLI sign-in.
+- `codeowners generate --section` now scopes Label Owner entries to the requested section, so entries from other sections no longer leak into the generated block.
+- Updated `GitHub.Copilot.SDK` to 1.0.8 so Copilot-backed commands accept ISO-8601 `ping` timestamps returned by current Copilot CLI versions.
+
+## 0.6.30 (2026-07-23)
+
+### Features Added
+
+- Added a notification service that sends an email notification when a release plan is created. Notifications are sent only when the notification service URL environment variable is configured.
+
+### Bugs Fixed
+
+- Fixed release plan SDK details update to avoid marking a language as missing emitter config when the TypeSpec parser did not detect any package name.
+
+## 0.6.28 (2026-07-16)
+
+### Features Added
+
+- Added a new helper method to get user profile from a GitHub user name
+
+### Bugs Fixed
+
+- Hide logs for gh auth
+
+## 0.6.27 (2026-07-13)
+
+### Features Added
+
+- Update release status CLI command to take release pipeline URL as a parameter to update it in the release plan. Also updated this tool to accept SDK release type and SDK pull request to lookup the release plan using pull request/release type.
+
+## 0.6.26 (2026-07-09)
+
+### Breaking Changes
+
+- `azsdk config codeowners check-package` now returns structured issue results with target-aware metadata (`resolved_target`, `resolved_target_type`, `issues[]`), issue-specific `/owners ...` fix prompts, and a CODEOWNERS-specific support link. 
+
+### Other Changes
+
+`eng/common/scripts/Test-CodeownersForArtifacts.ps1` now prints each `check-package` result and summarizes failed packages with the matching issue text and prompt template.
+
+## 0.6.25 (2026-07-07)
+
+### Features Added
+
+- `azsdk_update_sdk_details_in_release_plan` now marks languages with missing emitter configuration in the TypeSpec project as `MissingEmitterConfig` instead of `Requested` in the release plan work item, so the release plan dashboard shows a distinct "Missing emitter configuration" label instead of the misleading "Exclusion Requested" label.
+
+### Bugs Fixed
+
+- Reading the status, checks, and labels of a public pull request (for example, the spec pull request during SDK generation) no longer requires GitHub authentication. These read-only operations are now attempted anonymously first, and only fall back to an authenticated request (prompting the user to run `gh auth login`) when GitHub indicates authentication is required, such as for a private repository.
+
+- The create release plan tool no longer accepts an `--sdk-type` parameter. The SDK release type is now always derived from the API release type (GA maps to a stable SDK release, preview maps to a beta SDK release), preventing a stable SDK release from a preview API version.
+
+- The create and update release plan tools now give clear guidance when run from a language SDK repository (or any directory that is not the `azure-rest-api-specs`/`azure-rest-api-specs-pr` repo). Instead of incorrectly reporting that the spec is in a private repository, they now ask the user to provide the absolute path to the TypeSpec project or to run the command from within the `Azure/azure-rest-api-specs` repository.
+- Authentication failures against Azure DevOps now return a clearer error message that instructs the user to sign in with the Azure CLI using the default Microsoft tenant (`az login --tenant microsoft.onmicrosoft.com`), which resolves failures caused by being signed in with a different tenant.
+
+- Requests such as "run SDK generation for all languages for release <id>" are now routed to the correct SDK generation pipeline tool (`azsdk_run_generate_sdk`) instead of the release/publish tool.
+- The `azsdk_run_generate_sdk` and `azsdk_release_sdk` tool descriptions were clarified to disambiguate generating an SDK from releasing an already-generated package, and a dedicated `azsdk-common-generate-sdk-pipeline` skill was added to route release-plan / all-language / pipeline generation prompts to `azsdk_run_generate_sdk` (called once per language).
+
+## 0.6.24 (2026-06-30)
+
+### Features Added
+
+- Update package details in release plan using package name in tspconfig.yaml when a new release plan is created.
+
+### Bugs Fixed
+
+- `azsdk_update_sdk_details_in_release_plan` no longer fails for data-plane release plans when the TypeSpec project emits an optional Go package. Go is now accepted as an optional data-plane language and its package name is written to the release plan (Go remains not required, so it is not flagged as an excluded language when absent). Languages the release plan does not track (e.g. Rust, C++) are now skipped instead of causing the update to fail, and are reported in the result message.
+
+- Update SDK details to use explicit output directory param when running TypeSpec emitter.
+
+## 0.6.23 (2026-06-24)
+
+### Features Added
+
+- Release plans now resolve and persist Product Name, Product Type, and Product Lifecycle (copied from a previous release plan on create, or from a matching Triage work item on update via a new `--product-type` / `productType` parameter).
+
+## 0.6.22 (2026-06-22)
+
+### Features Added
+
+- Added an `editScope` parameter (`--edit-scope`) to the `customized-update` command / `azsdk_customized_code_update` MCP tool. It is a flags enum (`CustomCode`, `SpecInputs`, `All`; default `All`). `CustomCode` restricts the tool to custom (non-generated) code: it never edits spec inputs (client.tsp/tspconfig.yaml) or moves the pinned spec commit, and feedback requiring a spec change is reported as out of scope via the `SpecChangeRequired` error code instead of being applied. `SpecInputs` restricts the tool to spec-input edits: it never patches custom code, and feedback requiring a custom-code change is reported as out of scope via the new `CustomCodeChangeRequired` error code instead of being applied. The edit scope is also passed to the feedback classifier so that items addressable either way (e.g. renames doable in spec OR custom code) are biased toward the in-scope axis instead of being reported as out of scope. Regenerating `Generated/` from the unchanged pinned commit is always allowed.
+- Made `tspProjectPath` (`--tsp-project-path`) optional on the `customized-update` command / `azsdk_customized_code_update` MCP tool. It is now required only when the edit scope includes spec inputs (`SpecInputs`/`All`). For custom-code-only repair (`editScope CustomCode`) it may be omitted: regeneration then runs `tsp-client update` without `--local-spec-repo`, so the `tsp-client` CLI regenerates from the repo and commit pinned in the package's `tsp-location.yaml` instead of a local checkout. This enables headless custom-code build repair in a language repo where the spec is not checked out.
+
+### Breaking Changes
+
+- Replaced the `package find-work-item` CLI command with `package get-work-item`, which returns the full Azure DevOps package work item, and added `package update-work-item` for patching package work item fields.
+
+## 0.6.21 (2026-06-18)
+
+### Features Added
+
+- Added UX and functionality improvements to `azp` sub-commands for pipeline analysis
+- Added --copilot mode to pipeline analysis to call the user's copilot CLI installation for processing
+- Enable pipeline analysis commands to take a GitHub PR link in addition to pipeline link or ID
+
+### Breaking Changes
+
+- Removed upstream RAG-based/hosted model pipeline analysis mode via `azsdk azp analyze --agent`
+
+### Other Changes
+
+- Added service ID and product ID as optional when creating a release plan
+- Replaced product life cycle property with release plan type when fetching attestation status
+
+## 0.6.20 (2026-06-16)
+
+### Features Added
+
+- Set ADO work item ID as release plan ID for new release plans.
+
+### Bugs Fixed
+
+- Fixed MCP server infinite respawn loop when upgrade or install fails due to rate limiting or network errors.
+
+### Other Changes
+
+- Improved GEPA skill quality scores for all shared skills.
+- Updated prepare-release-plan skill with canonical convergence and Release Plan ID documentation.
+
+## 0.6.19 (2026-06-12)
+
+### Features Added
+
+- Release plan is automatically marked as "Finished" when all required language SDKs are either Released or have an Approved exclusion. Management plane checks all 5 languages; data plane checks .NET, Java, Python, and JavaScript only.
+
+### Bugs Fixed
+
+- Release plan tools now accept either the user-facing Release Plan ID or the Azure DevOps work item ID. Tools resolve the supplied number by trying it as a Release Plan ID first, then falling back to a work item ID lookup.
+- `GetReleasePlanForWorkItemAsync` now verifies the work item's `System.WorkItemType` is `Release Plan` before mapping, preventing a non-release-plan work item from being mapped to an empty release plan.
+
+## 0.6.18 (2026-06-08)
+
+### Other Changes
+
+- Updated the release plan response to include the link to release plan dashboard.
+- Added release plan type check in SDK generation and inform the agent that SDK generation is not required for private preview. 
+
+## 0.6.17 (2026-06-02)
+
+### Bugs Fixed
+
+- Fixed issues in the MCP tool to lookup service details using TypeSpec project path.
+
+## 0.6.16 (2026-06-01)
+
+### Bugs Fixed
+
+- Fixed DevOps work item creation for empty DateTime fields (#15795)
+
+## 0.6.15 (2026-05-29)
+
+### Bugs Fixed
+
+- Fixed the Update SDK Details MCP tool to read package names from the TypeSpec metadata emitter output (typespec-metadata.yaml).
+
+## 0.6.14 (2026-05-27)
+
+### Features Added
+
+- Added pre-build step for the .NET plugin during SDK generation
+- Added `apiReleaseType` required parameter to `CreateReleasePlan` (options: Private Preview, Public Preview, GA) to set `Custom.ReleasePlanType` in ADO work items.
+- Spec PR validation against release type: Private Preview requires `azure-rest-api-specs-pr`; Public Preview/GA requires `azure-rest-api-specs`.
+- SDK release type now defaults automatically (beta for preview, stable for GA) when not provided.
+- Duplicate release plan check now considers API release type, allowing separate plans for different release stages.
+- Release plan title format updated to include release type (e.g., "Private Preview release plan for Contoso.Management").
+
+### Breaking Changes
+
+- Removed `userEmail` parameter from `CreateReleasePlan`; email is resolved automatically.
+- `sdkReleaseType` parameter in `CreateReleasePlan` is now optional (was required).
+
+## 0.6.13 (2026-05-18)
+
+### Features Added
+
+- Added optional `--release-plan-id` parameter to `update-release-status` CLI command. When provided, it is used as an additional filter on top of the package name search to select the correct release plan. Returns a message if the specified release plan ID is not found among matching plans.
+- Get release plan returns the link to new release planner dashboard https://aka.ms/azsdk/releaseplan-dashboard
+
+### Bugs Fixed
+
+- `azsdk_release_sdk` now passes a `release_<safeName>=true` template parameter when triggering Java release pipelines so per-package selection works (azure-sdk-for-java#48465). Previously, manually queued Java releases failed fast because no package was selected. (#14832)
+- Removed the check requiring Java package names to include group name in `groupName:packageName` format when updating release status.
+
+### Other Changes
+
+- Set `TriggerSource` when running SDK generation so PRs open as ready for review.
+
+## 0.6.12 (2026-05-04)
+
+### Other Changes
+
+- Resolve npm exec binaries directly from node_modules for NpmOptions when `.npmrc` is in user context
+
+## 0.6.11 (2026-05-01)
+
+### Features Added
+
+- Added `AZSDK_COPILOT_CLI_PATH` environment variable to provide a custom path to the Copilot CLI executable (`copilot`/`copilot.exe`) for the GitHub Copilot SDK when the bundled binary is unavailable in standalone builds.
+
+### Bugs Fixed
+
+- Fixed misleading "No feedback items to process" error when Copilot CLI is missing. Now surfaces the actual error with installation instructions and env var workaround.
+- Introduced `CopilotCliUnavailableException` to distinguish Copilot CLI issues from other failures across all copilot-dependent tools.
+
+### Other Changes
+
+- Bumped `GitHub.Copilot.SDK` from 0.1.32 to 0.2.2.
+- Audit reads data from the cache to reduce GitHub API use
+
+## 0.6.10 (2026-04-27)
+
+### Features Added
+
+- Added Rust language support for `setup`, `generate`, `build`, and `pack` tools.
+- Added `azsdk_get_kpi_attestation_status` MCP tool to check KPI attestation status for a release plan given product ID and lifecycle.
+- Added CODEOWNERS Audit command (CLI only) that brings data model to a valid state.
+- Added optional package version argument for `azsdk release-plan update-release-status` CLI.
+
+### Other Changes
+
+- Surface APIView link in `azsdk_release_sdk` when APIView approval is missing
+
+### Bugs Fixed
+
+- Release plan ID and work item ID in `azsdk_get_release_plan` were being confused by agent. Reordered arguments and updated description to enforce release plan ID as main argument to provide. 
+
+## 0.6.9 (2026-04-16)
+
+### Features Added
+
+- Added MCP tool for updating the CODEOWNERS cache
+
+### Other Changes
+
+- Made spec PR optional parameter for both `azsdk_create_release_plan` and `azsdk_get_release_plan`
+
+## 0.6.8 (2026-04-15)
+
+### Features Added
+
+- Added CODEOWNERS validation for paths, useful for release and PR checks
+
+## 0.6.7 (2026-04-13)
+
+### Features Added
+
+- Added support to collect telemetry for sanitized user prompts
+- Added `azsdk_apiview_get_review_url` MCP tool and `azsdk apiview get-review-url` CLI command to retrieve the APIView review URL for a package by name and language
+- Added recorded and live test support for Python, JavaScript, Java and .NET
+- Enhanced `azsdk_customized_code_update` with a two-phase AI-assisted customization workflow: Phase A applies TypeSpec decorators (`client.tsp`) to fix ~80% of issues, Phase B applies targeted code-level patches to customization files when the build still fails after regeneration
+- `azsdk_customized_code_update` now accepts APIView review URLs as input in addition to plain-text customization requests and build error output, enabling direct resolution of API review feedback
+- `azsdk_customized_code_update` customization flow is now enabled for .NET, Java, JavaScript, and Python
+- Added support for updating `ci.yml` in SDK projects
+- Implemented version update for Java, Python, and .NET language services
+
+### Other Changes
+
+- Updated `azsdk_typespec_delegate_apiview_feedback` to split the feedback summary table into addressed/not-addressed sections for easier review
+
+## 0.6.6 (2026-04-01)
+
+### Features Added
+
+- Added support for CODEOWNERS "Section" in Label Owners (defaults to "Client Libraries")
+
+### Bugs Fixed
+
+- Fixed sample translation to preserve source directory structure when writing translated files
+
+### Other Changes
+
+- CODEOWNERS generator supports file paths and doesn't assume all paths are directories
+
+## 0.6.5 (2026-03-27)
+
+### Features Added
+
+- Implemented version update for Go language service
+- Added team support for CODEOWNERS add/remove tools
+
+## 0.6.4 (2026-03-25)
+
+### Features Added
+
+- Added a new CLI command to ingest telemetry events from Copilot hooks
+
+## 0.6.3 (2026-03-12)
+
+### Bugs Fixed
+
+- Fixed a bug that caused the update release status CLI command to fail when a release plan was not found for a package.
+
+## 0.6.2 (2026-03-11)
+
+### Features Added
+
+- Added MCP progress reporting to long running tools including SDK generation, build, and pack tools
+
+### Bugs Fixed
+
+- Fixed a bug in get release plan CLI when release plan is fetched using api spec pull request.
+
+## 0.6.1 (2026-03-05)
+
+### Features Added
+
+- Added `azsdk_package_pack` tool to create package artifacts
+- Improved `azsdk_typespec_delegate_apiview_feedback` tool description to better recognize intent expressed as "address", "fix", or "resolve" APIView feedback
+- Added a CLI command `azsdk release-plan update` and MCP tool `azsdk_update_release_plan` to update release plan.
+- Updated CLI command `azsdk release-plan get` to get release plan using API spec pull request or spec project path.
+
+### Bugs Fixed
+
+- Filter out downvoted `azure-sdk` bot comments from APIView feedback to reduce noise in delegated issues
+
+## 0.6.0 (2026-02-27)
+
+### Features Added
+
+- Added auto-install to `azsdk verify setup` MCP and CLI tool, enabling auto-installing of supported missing requirements
+- Changed the CLI interface for verifying setup to `azsdk verify setup check` for non-install mode, and `azsdk verify setup install`
+- Added `azsdk eng package-info` command for CI pipeline package manifest generation
+- Switch Go language service to use C# native package info generation
+- Customized code update tool now uses copilot sdk
+
+## 0.5.19 (2026-02-25)
+
+### Bugs Fixed
+
+- Override path extension variable to support running commands on Windows without extension.
+
 ## 0.5.18 (2026-02-24)
 
 ### Bugs Fixed

@@ -2,9 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
+using System.Security.Claims;
 using System.Text.Json;
 using System.Threading.Tasks;
-using ApiView;
+using APIView;
+using APIView.Identity;
 using APIView.Model;
 using APIViewWeb;
 using APIViewWeb.Helpers;
@@ -72,7 +75,6 @@ public class APIRevisionsManagerTests
 {
     private readonly APIRevisionsManager _manager;
     private readonly Mock<ICosmosAPIRevisionsRepository> _mockAPIRevisionsRepository;
-    private readonly Mock<IDiagnosticCommentService> _mockDiagnosticCommentService;
     private readonly Mock<IAuthorizationService> _mockAuthorizationService;
     private readonly Mock<ICodeFileManager> _mockCodeFileManager;
     private readonly Mock<IBlobCodeFileRepository> _mockCodeFileRepository;
@@ -80,9 +82,11 @@ public class APIRevisionsManagerTests
     private readonly Mock<IDevopsArtifactRepository> _mockDevopsArtifactRepository;
     private readonly Mock<IHubContext<SignalRHub>> _mockHubContext;
     private readonly Mock<INotificationManager> _mockNotificationManager;
+    private readonly Mock<ICosmosCommentsRepository> _mockCommentsRepository;
     private readonly Mock<IBlobOriginalsRepository> _mockOriginalsRepository;
     private readonly Mock<ICosmosReviewRepository> _mockReviewsRepository;
     private readonly Mock<IProjectsManager> _mockProjectsManager;
+    private readonly Mock<IAPIVersionsManager> _mockApiVersionsManager;
     private readonly TelemetryClient _telemetryClient;
     private readonly TestLanguageService _testLanguageService;
 
@@ -91,15 +95,19 @@ public class APIRevisionsManagerTests
         _mockReviewsRepository = new Mock<ICosmosReviewRepository>();
         _mockCodeFileRepository = new Mock<IBlobCodeFileRepository>();
         _mockAPIRevisionsRepository = new Mock<ICosmosAPIRevisionsRepository>();
-        _mockDiagnosticCommentService = new Mock<IDiagnosticCommentService>();
         _mockOriginalsRepository = new Mock<IBlobOriginalsRepository>();
         _mockAuthorizationService = new Mock<IAuthorizationService>();
         _mockHubContext = new Mock<IHubContext<SignalRHub>>();
         _mockCodeFileManager = new Mock<ICodeFileManager>();
         _mockDevopsArtifactRepository = new Mock<IDevopsArtifactRepository>();
         _mockNotificationManager = new Mock<INotificationManager>();
+        _mockCommentsRepository = new Mock<ICosmosCommentsRepository>();
         _mockConfiguration = new Mock<IConfiguration>();
         _mockProjectsManager = new Mock<IProjectsManager>();
+        _mockApiVersionsManager = new Mock<IAPIVersionsManager>();
+        _mockApiVersionsManager
+            .Setup(m => m.GetOrCreateVersionAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string>()))
+            .ReturnsAsync(new APIVersionModel { Id = "default-version-id" });
 
         TelemetryConfiguration telemetryConfiguration = new();
         _telemetryClient = new TelemetryClient(telemetryConfiguration);
@@ -112,7 +120,6 @@ public class APIRevisionsManagerTests
             _mockAuthorizationService.Object,
             _mockReviewsRepository.Object,
             _mockAPIRevisionsRepository.Object,
-            _mockDiagnosticCommentService.Object,
             _mockHubContext.Object,
             languageServices,
             _mockDevopsArtifactRepository.Object,
@@ -120,10 +127,161 @@ public class APIRevisionsManagerTests
             _mockCodeFileRepository.Object,
             _mockOriginalsRepository.Object,
             _mockNotificationManager.Object,
+            _mockCommentsRepository.Object,
             _telemetryClient,
             _mockProjectsManager.Object,
+            _mockApiVersionsManager.Object,
             _mockConfiguration.Object
         );
+    }
+
+    [Fact]
+    public async Task MarkAPIRevisionReleasedAsync_MarksAndPersistsRevision()
+    {
+        const string revisionId = "revision-1";
+        var revision = new APIRevisionListItemModel
+        {
+            Id = revisionId,
+            IsReleased = false
+        };
+        _mockAPIRevisionsRepository.Setup(r => r.GetAPIRevisionAsync(revisionId)).ReturnsAsync(revision);
+
+        DateTime before = DateTime.UtcNow;
+        APIRevisionListItemModel result = await _manager.MarkAPIRevisionReleasedAsync(revisionId);
+        DateTime after = DateTime.UtcNow;
+
+        Assert.True(result.IsReleased);
+        Assert.InRange(result.ReleasedOn, before, after);
+        _mockAPIRevisionsRepository.Verify(r => r.UpsertAPIRevisionAsync(revision), Times.Once);
+    }
+
+    [Fact]
+    public async Task MarkAPIRevisionReleasedAsync_WhenAlreadyReleased_DoesNotPersistAgain()
+    {
+        const string revisionId = "revision-1";
+        var revision = new APIRevisionListItemModel
+        {
+            Id = revisionId,
+            IsReleased = true,
+            ReleasedOn = DateTime.UtcNow.AddDays(-1)
+        };
+        _mockAPIRevisionsRepository.Setup(r => r.GetAPIRevisionAsync(revisionId)).ReturnsAsync(revision);
+
+        APIRevisionListItemModel result = await _manager.MarkAPIRevisionReleasedAsync(revisionId);
+
+        Assert.Same(revision, result);
+        _mockAPIRevisionsRepository.Verify(r => r.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task GetAPIRevisionsAsync_WithMultipleExactVersionMatches_ReturnsNewestFirst()
+    {
+        const string reviewId = "review-1";
+        var olderRevision = new APIRevisionListItemModel
+        {
+            Id = "older",
+            CreatedOn = DateTime.UtcNow.AddDays(-1),
+            Files = [new APICodeFileModel { PackageVersion = "1.2.3" }]
+        };
+        var newerRevision = new APIRevisionListItemModel
+        {
+            Id = "newer",
+            CreatedOn = DateTime.UtcNow,
+            Files = [new APICodeFileModel { PackageVersion = "1.2.3" }]
+        };
+        _mockAPIRevisionsRepository
+            .Setup(r => r.GetAPIRevisionsAsync(reviewId))
+            .ReturnsAsync([olderRevision, newerRevision]);
+
+        IEnumerable<APIRevisionListItemModel> result = await _manager.GetAPIRevisionsAsync(reviewId, "1.2.3");
+
+        Assert.Equal(["newer", "older"], result.Select(revision => revision.Id));
+    }
+
+    [Fact]
+    public async Task ToggleAPIRevisionApprovalAsync_SendsSubscriberEmail_WhenRevisionApprovedAndReviewAlreadyApproved()
+    {
+        var user = CreateTestUser("approver1");
+        const string reviewId = "review-1";
+        const string revisionId = "revision-1";
+
+        var review = new ReviewListItemModel
+        {
+            Id = reviewId,
+            IsApproved = true,
+            ChangeHistory = new List<ReviewChangeHistoryModel>()
+        };
+
+        var revision = new APIRevisionListItemModel
+        {
+            Id = revisionId,
+            ReviewId = reviewId,
+            IsApproved = false,
+            Approvers = new HashSet<string>(),
+            ChangeHistory = new List<APIRevisionChangeHistoryModel>()
+        };
+
+        SetupSignalRMocks();
+        _mockAuthorizationService
+            .Setup(a => a.AuthorizeAsync(
+                It.IsAny<ClaimsPrincipal>(),
+                It.IsAny<object>(),
+                It.IsAny<IEnumerable<IAuthorizationRequirement>>()))
+            .ReturnsAsync(AuthorizationResult.Success());
+        _mockAPIRevisionsRepository.Setup(r => r.GetAPIRevisionAsync(revisionId)).ReturnsAsync(revision);
+        _mockReviewsRepository.Setup(r => r.GetReviewAsync(reviewId)).ReturnsAsync(review);
+        _mockAPIRevisionsRepository.Setup(r => r.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>())).Returns(Task.CompletedTask);
+
+        var result = await _manager.ToggleAPIRevisionApprovalAsync(user, reviewId, revisionId);
+
+        Assert.False(result.updateReview);
+        Assert.True(result.apiRevision.IsApproved);
+        _mockNotificationManager.Verify(
+            n => n.NotifySubscribersOnApprovalAsync(review, revision, user, false),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ToggleAPIRevisionApprovalAsync_DoesNotSendRevisionEmail_WhenReviewWillBeAutoApproved()
+    {
+        var user = CreateTestUser("approver1");
+        const string reviewId = "review-1";
+        const string revisionId = "revision-1";
+
+        var review = new ReviewListItemModel
+        {
+            Id = reviewId,
+            IsApproved = false,
+            ChangeHistory = new List<ReviewChangeHistoryModel>()
+        };
+
+        var revision = new APIRevisionListItemModel
+        {
+            Id = revisionId,
+            ReviewId = reviewId,
+            IsApproved = false,
+            Approvers = new HashSet<string>(),
+            ChangeHistory = new List<APIRevisionChangeHistoryModel>()
+        };
+
+        SetupSignalRMocks();
+        _mockAuthorizationService
+            .Setup(a => a.AuthorizeAsync(
+                It.IsAny<ClaimsPrincipal>(),
+                It.IsAny<object>(),
+                It.IsAny<IEnumerable<IAuthorizationRequirement>>()))
+            .ReturnsAsync(AuthorizationResult.Success());
+        _mockAPIRevisionsRepository.Setup(r => r.GetAPIRevisionAsync(revisionId)).ReturnsAsync(revision);
+        _mockReviewsRepository.Setup(r => r.GetReviewAsync(reviewId)).ReturnsAsync(review);
+        _mockAPIRevisionsRepository.Setup(r => r.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>())).Returns(Task.CompletedTask);
+
+        var result = await _manager.ToggleAPIRevisionApprovalAsync(user, reviewId, revisionId);
+
+        Assert.True(result.updateReview);
+        Assert.True(result.apiRevision.IsApproved);
+        _mockNotificationManager.Verify(
+            n => n.NotifySubscribersOnApprovalAsync(It.IsAny<ReviewListItemModel>(), It.IsAny<APIRevisionListItemModel>(), It.IsAny<ClaimsPrincipal>(), false),
+            Times.Never);
     }
 
     [Fact]
@@ -225,6 +383,112 @@ public class APIRevisionsManagerTests
             Times.Never);
     }
 
+    [Fact]
+    public async Task UpdateAPIRevisionAsync_SkipsRevision_WhenOriginalIsEmpty()
+    {
+        APIRevisionListItemModel revision = CreateTestRevision();
+
+        _mockOriginalsRepository
+            .Setup(x => x.GetOriginalAsync(revision.Files[0].FileId))
+            .ReturnsAsync(new MemoryStream()); // empty stream
+
+        await _manager.UpdateAPIRevisionAsync(revision, _testLanguageService, false);
+
+        // GetCodeFileAsync should never be called because we skip on empty original
+        Assert.Null(_testLanguageService.CapturedCrossLanguageMetadataJson);
+        _mockAPIRevisionsRepository.Verify(
+            x => x.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task GetAPIRevisionAsync_TriggersPipeline_WhenIsReviewGenByPipelineIsTrue()
+    {
+        const string revisionId = "pipeline-revision-id";
+        const string reviewId = "pipeline-review-id";
+
+        var revision = new APIRevisionListItemModel
+        {
+            Id = revisionId,
+            ReviewId = reviewId,
+            Language = "Python",
+            Files = new List<APICodeFileModel>
+            {
+                new() { FileId = "file-id", FileName = "azure_test-1.0.0-py3-none-any.whl", HasOriginal = true, VersionString = "1.0.0", Language = "Python" }
+            }
+        };
+
+        var review = new ReviewListItemModel { Id = reviewId, Language = "Python" };
+
+        _testLanguageService.IsReviewGenByPipeline = true;
+        try
+        {
+            _mockAPIRevisionsRepository
+                .Setup(r => r.GetAPIRevisionAsync(revisionId))
+                .ReturnsAsync(revision);
+            _mockReviewsRepository
+                .Setup(r => r.GetReviewAsync(reviewId))
+                .ReturnsAsync(review);
+            _mockOriginalsRepository
+                .Setup(x => x.GetContainerUrl())
+                .Returns("https://test.blob.core.windows.net/originals");
+            _mockDevopsArtifactRepository
+                .Setup(x => x.RunPipeline(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
+                .Returns(Task.CompletedTask);
+
+            await _manager.GetAPIRevisionAsync(revisionId);
+
+            _mockDevopsArtifactRepository.Verify(
+                x => x.RunPipeline(
+                    It.Is<string>(s => s.Contains("Python")),
+                    It.IsAny<string>(),
+                    It.IsAny<string>()),
+                Times.Once);
+        }
+        finally
+        {
+            _testLanguageService.IsReviewGenByPipeline = false;
+        }
+    }
+
+    #region APIVersionId Tests
+
+    [Fact]
+    public async Task CreateAPIRevisionAsync_WithPackageVersion_SetsAPIVersionId()
+    {
+        const string reviewId = "review-id";
+        const string expectedVersionId = "ver-id";
+
+        var codeFile = new CodeFile
+        {
+            Name = "test.json",
+            Language = "C#",
+            PackageName = "TestPackage",
+            PackageVersion = "1.0.0"
+        };
+
+        _mockApiVersionsManager
+            .Setup(m => m.GetOrCreateVersionAsync(reviewId, "1.0.0", It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string>()))
+            .ReturnsAsync(new APIVersionModel { Id = expectedVersionId });
+
+        _mockCodeFileManager
+            .Setup(m => m.CreateReviewCodeFileModel(It.IsAny<string>(), It.IsAny<MemoryStream>(), It.IsAny<CodeFile>()))
+            .ReturnsAsync(new APICodeFileModel { FileId = "file-id", FileName = "test.json" });
+
+        _mockAPIRevisionsRepository
+            .Setup(m => m.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>()))
+            .Returns(Task.CompletedTask);
+
+        using var memoryStream = new MemoryStream();
+        APIRevisionListItemModel revision = await _manager.CreateAPIRevisionAsync(
+            userName: "testuser", reviewId: reviewId, apiRevisionType: APIRevisionType.Automatic,
+            label: "test-label", memoryStream: memoryStream, codeFile: codeFile, originalName: "test.json");
+
+        Assert.Equal(expectedVersionId, revision.APIVersionId);
+    }
+
+    #endregion
+
     private APIRevisionListItemModel CreateTestRevision(string revisionId = "test-revision-id",
         string fileId = "test-file-id",
         string fileName = "test-package_python.json")
@@ -242,7 +506,7 @@ public class APIRevisionsManagerTests
 
     private void SetupMocksForUpdate(string revisionId, string fileId, CodeFile existingCodeFile, CodeFile newCodeFile)
     {
-        MemoryStream originalStream = new();
+        MemoryStream originalStream = new(new byte[] { 0x50, 0x4B, 0x03, 0x04 }); // non-empty placeholder
 
         _mockOriginalsRepository
             .Setup(x => x.GetOriginalAsync(fileId))
@@ -264,6 +528,31 @@ public class APIRevisionsManagerTests
             VersionString = "2.0.0",
             CrossLanguageMetadata = crossLanguageMetadata
         };
+    }
+
+    private static ClaimsPrincipal CreateTestUser(string login)
+    {
+        var identity = new ClaimsIdentity(new[]
+        {
+            new Claim(ClaimConstants.Login, login),
+            new Claim(ClaimConstants.Name, login),
+            new Claim(ClaimConstants.Email, $"{login}@contoso.com")
+        });
+        return new ClaimsPrincipal(identity);
+    }
+
+    private void SetupSignalRMocks()
+    {
+        var clients = new Mock<IHubClients>();
+        var proxy = new Mock<IClientProxy>();
+
+        proxy
+            .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<System.Threading.CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        clients.Setup(c => c.Group(It.IsAny<string>())).Returns(proxy.Object);
+        clients.Setup(c => c.All).Returns(proxy.Object);
+        _mockHubContext.Setup(h => h.Clients).Returns(clients.Object);
     }
 
     #region UpdateAPIRevisionCodeFileAsync Tests
@@ -293,6 +582,7 @@ public class APIRevisionsManagerTests
             .ReturnsAsync(new APIRevisionListItemModel
             {
                 Id = TestApiRevisionId,
+                ReviewId = TestReviewId,
                 Language = "Python",
                 Files = new List<APICodeFileModel> { new() { FileId = TestFileId, FileName = TestFileName } }
             });
@@ -347,6 +637,38 @@ public class APIRevisionsManagerTests
         Assert.Null(result.CrossLanguageMetadata);
     }
 
+    [Fact]
+    public async Task UpdateAPIRevisionCodeFileAsync_WhenRevisionBelongsToDifferentReview_SkipsUpdate()
+    {
+        MemoryStream zipStream = await CreateZipArchiveWithCodeFile(TestReviewId, TestApiRevisionId, TestFileId, CreatePipelineCodeFile(null));
+
+        _mockDevopsArtifactRepository
+            .Setup(x => x.DownloadPackageArtifact(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), null,
+                It.IsAny<string>(), "zip"))
+            .ReturnsAsync(zipStream);
+
+        _mockReviewsRepository
+            .Setup(x => x.GetReviewAsync(TestReviewId))
+            .ReturnsAsync(new ReviewListItemModel { Id = TestReviewId, Language = "Python" });
+
+        _mockAPIRevisionsRepository
+            .Setup(x => x.GetAPIRevisionAsync(TestApiRevisionId))
+            .ReturnsAsync(new APIRevisionListItemModel
+            {
+                Id = TestApiRevisionId,
+                ReviewId = "different-review-id",
+                Language = "Python",
+                Files = new List<APICodeFileModel> { new() { FileId = TestFileId, FileName = TestFileName } }
+            });
+
+        await _manager.UpdateAPIRevisionCodeFileAsync("test-repo", "12345", "apiview", "internal");
+
+        _mockCodeFileRepository.Verify(x => x.GetCodeFileFromStorageAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+        _mockCodeFileRepository.Verify(x => x.UpsertCodeFileAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CodeFile>()), Times.Never);
+        _mockAPIRevisionsRepository.Verify(x => x.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>()), Times.Never);
+        _mockReviewsRepository.Verify(x => x.UpsertReviewAsync(It.IsAny<ReviewListItemModel>()), Times.Never);
+    }
+
     private async Task<MemoryStream> CreateZipArchiveWithCodeFile(string reviewId, string apiRevisionId, string fileId,
         CodeFile codeFile)
     {
@@ -399,14 +721,14 @@ public class APIRevisionsManagerTests
                 Documentation = "Test documentation",
                 Type = "client"
             },
-            Languages = new Dictionary<string, LanguageConfig>
+            Languages = new Dictionary<string, List<LanguageConfig>>
             {
-                ["python"] = new LanguageConfig
+                ["python"] = [new LanguageConfig
                 {
                     EmitterName = "@azure-tools/typespec-python",
                     PackageName = "azure-ai-textanalytics",
                     Namespace = "azure.ai.textanalytics"
-                }
+                }]
             },
             SourceConfigPath = "specification/ai/Azure.AI.TextAnalytics/tspconfig.yaml"
         };
@@ -431,6 +753,7 @@ public class APIRevisionsManagerTests
             .ReturnsAsync(new APIRevisionListItemModel
             {
                 Id = apiRevisionId,
+                ReviewId = reviewId,
                 Language = ApiViewConstants.TypeSpecLanguage,
                 Files = new List<APICodeFileModel> { new() { FileId = fileId, FileName = TestFileName } }
             });
@@ -477,6 +800,7 @@ public class APIRevisionsManagerTests
             .ReturnsAsync(new APIRevisionListItemModel
             {
                 Id = TestApiRevisionId,
+                ReviewId = TestReviewId,
                 Language = "Python",
                 Files = new List<APICodeFileModel> { new() { FileId = TestFileId, FileName = TestFileName } }
             });
@@ -1161,6 +1485,935 @@ public class APIRevisionsManagerTests
                 }
             }
         };
+    }
+
+    #endregion
+
+    #region GetReviewQualityScoreAsync Tests
+
+    private APIRevisionListItemModel CreateRevisionForQualityTest(string reviewId = "review-1", string revisionId = "rev-1")
+    {
+        return new APIRevisionListItemModel
+        {
+            Id = revisionId,
+            ReviewId = reviewId,
+            Language = "Python",
+            PackageName = "test-package",
+            Files = new List<APICodeFileModel>
+            {
+                new APICodeFileModel
+                {
+                    FileId = "file-1",
+                    Name = "test-package (1.0.0)",
+                    FileName = "test.whl",
+                    Language = "Python",
+                    PackageName = "test-package",
+                    PackageVersion = "1.0.0",
+                    VersionString = "1.0.0"
+                }
+            }
+        };
+    }
+
+    private CommentItemModel CreateComment(
+        CommentSeverity? severity,
+        bool isResolved = false,
+        CommentSource source = CommentSource.UserGenerated,
+        float confidenceScore = 1.0f,
+        string reviewId = "review-1",
+        string apiRevisionId = "rev-1",
+        string elementId = null,
+        string threadId = null,
+        DateTime? createdOn = null)
+    {
+        return new CommentItemModel
+        {
+            ReviewId = reviewId,
+            APIRevisionId = apiRevisionId,
+            CommentType = CommentType.APIRevision,
+            Severity = severity,
+            IsResolved = isResolved,
+            CommentSource = source,
+            ConfidenceScore = confidenceScore,
+            CommentText = "Test comment",
+            ElementId = elementId ?? Guid.NewGuid().ToString(),
+            ThreadId = threadId,
+            CreatedOn = createdOn ?? DateTime.UtcNow
+        };
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_NoComments_Returns100()
+    {
+        var revision = CreateRevisionForQualityTest();
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(new List<CommentItemModel>());
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(100, result.Score);
+        Assert.Equal(0, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_OnlyResolvedComments_Returns100()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.MustFix, isResolved: true),
+            CreateComment(CommentSeverity.ShouldFix, isResolved: true)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(100, result.Score);
+        Assert.Equal(0, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_QuestionComments_DoNotDegradeScore()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.Question),
+            CreateComment(CommentSeverity.Question),
+            CreateComment(CommentSeverity.Question)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(100, result.Score);
+        Assert.Equal(3, result.UnresolvedQuestionCount);
+        Assert.Equal(3, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_MustFixDegradesScoreTheMost()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.MustFix)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(80, result.Score); // 100 - 20
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_ShouldFixPenalty()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.ShouldFix)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(90, result.Score); // 100 - 10
+        Assert.Equal(1, result.UnresolvedShouldFixCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_SuggestionPenalty()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.Suggestion)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(100, result.Score); // Suggestions have no penalty
+        Assert.Equal(1, result.UnresolvedSuggestionCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_MixedSeverities_CumulativePenalty()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.MustFix),
+            CreateComment(CommentSeverity.ShouldFix),
+            CreateComment(CommentSeverity.Suggestion),
+            CreateComment(CommentSeverity.Question)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // 100 - 20 (MustFix) - 10 (ShouldFix) - 0 (Suggestion) - 0 (Question) = 70
+        Assert.Equal(70, result.Score);
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+        Assert.Equal(1, result.UnresolvedShouldFixCount);
+        Assert.Equal(1, result.UnresolvedSuggestionCount);
+        Assert.Equal(1, result.UnresolvedQuestionCount);
+        Assert.Equal(4, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_ScoreNeverBelowZero()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>();
+        // 6 MustFix = 120 penalty, score should clamp to 0
+        for (int i = 0; i < 6; i++)
+        {
+            comments.Add(CreateComment(CommentSeverity.MustFix));
+        }
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(0, result.Score);
+        Assert.Equal(6, result.UnresolvedMustFixCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_AIGeneratedComments_ScaledByConfidence()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            // AI-generated MustFix with 0.5 confidence → penalty = 20 * 0.5 = 10
+            CreateComment(CommentSeverity.MustFix, source: CommentSource.AIGenerated, confidenceScore: 0.5f)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(90, result.Score); // 100 - (20 * 0.5) = 90
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_AIGeneratedWithZeroConfidence_NoPenalty()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.MustFix, source: CommentSource.AIGenerated, confidenceScore: 0f)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(100, result.Score);
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_UserAndAICommentsMixed()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            // User MustFix: -20
+            CreateComment(CommentSeverity.MustFix),
+            // AI ShouldFix with 0.8 confidence: -10 * 0.8 = -8
+            CreateComment(CommentSeverity.ShouldFix, source: CommentSource.AIGenerated, confidenceScore: 0.8f),
+            // User Suggestion: no penalty
+            CreateComment(CommentSeverity.Suggestion)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // 100 - 20 - 8 = 72
+        Assert.Equal(72, result.Score, precision: 2);
+        Assert.Equal(3, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_NullSeverity_UnknownPenalty()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(severity: null)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // null severity comments receive a ShouldFix-equivalent penalty and are counted as Unknown
+        Assert.Equal(90, result.Score); // 100 - 10
+        Assert.Equal(1, result.UnresolvedUnknownCount);
+        Assert.Equal(1, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_SampleRevisionComments_Ignored()
+    {
+        // SampleRevision comments are excluded at the DB level because the repository
+        // is queried with CommentType.APIRevision. The mock returns an empty list to
+        // reflect what the DB would actually return for that filter.
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>();
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        Assert.Equal(100, result.Score);
+        Assert.Equal(0, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_InvalidRevisionId_ThrowsArgumentException()
+    {
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync("bad-id")).ReturnsAsync((APIRevisionListItemModel)null);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => _manager.GetReviewQualityScoreAsync("bad-id"));
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_RepliesInSameThread_NotCountedSeparately()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var threadElement = "element-thread-1";
+        var baseTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var comments = new List<CommentItemModel>
+        {
+            // Thread starter: ShouldFix
+            CreateComment(CommentSeverity.ShouldFix, elementId: threadElement, createdOn: baseTime),
+            // Reply 1: no severity (null)
+            CreateComment(severity: null, elementId: threadElement, createdOn: baseTime.AddMinutes(5)),
+            // Reply 2: no severity (null)
+            CreateComment(severity: null, elementId: threadElement, createdOn: baseTime.AddMinutes(10))
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // Only the thread starter (ShouldFix) should be counted; replies are ignored
+        Assert.Equal(90, result.Score); // 100 - 10
+        Assert.Equal(1, result.UnresolvedShouldFixCount);
+        Assert.Equal(0, result.UnresolvedQuestionCount);
+        Assert.Equal(1, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_ThreadStarterSeverityUsed_NotReplySeverity()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var threadElement = "element-thread-2";
+        var baseTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var comments = new List<CommentItemModel>
+        {
+            // Thread starter: Question (no penalty)
+            CreateComment(CommentSeverity.Question, elementId: threadElement, createdOn: baseTime),
+            // Reply with MustFix severity (should be ignored since it's not the thread starter)
+            CreateComment(CommentSeverity.MustFix, elementId: threadElement, createdOn: baseTime.AddMinutes(5))
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // Only the thread starter (Question) determines severity — MustFix reply is ignored
+        Assert.Equal(100, result.Score);
+        Assert.Equal(1, result.UnresolvedQuestionCount);
+        Assert.Equal(0, result.UnresolvedMustFixCount);
+        Assert.Equal(1, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_MultipleThreadsCountedSeparately()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var baseTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var comments = new List<CommentItemModel>
+        {
+            // Thread 1: MustFix with 2 replies
+            CreateComment(CommentSeverity.MustFix, elementId: "elem-1", createdOn: baseTime),
+            CreateComment(severity: null, elementId: "elem-1", createdOn: baseTime.AddMinutes(1)),
+            CreateComment(severity: null, elementId: "elem-1", createdOn: baseTime.AddMinutes(2)),
+            // Thread 2: ShouldFix with 1 reply
+            CreateComment(CommentSeverity.ShouldFix, elementId: "elem-2", createdOn: baseTime),
+            CreateComment(severity: null, elementId: "elem-2", createdOn: baseTime.AddMinutes(1)),
+            // Thread 3: Question alone
+            CreateComment(CommentSeverity.Question, elementId: "elem-3", createdOn: baseTime)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // 3 threads: MustFix(-20), ShouldFix(-10), Question(0)
+        Assert.Equal(70, result.Score); // 100 - 20 - 10
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+        Assert.Equal(1, result.UnresolvedShouldFixCount);
+        Assert.Equal(1, result.UnresolvedQuestionCount);
+        Assert.Equal(3, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_ThreadIdTakesPriorityOverElementId()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var baseTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var comments = new List<CommentItemModel>
+        {
+            // Two comments with different ElementIds but same ThreadId → same thread
+            CreateComment(CommentSeverity.MustFix, elementId: "elem-A", threadId: "thread-1", createdOn: baseTime),
+            CreateComment(severity: null, elementId: "elem-B", threadId: "thread-1", createdOn: baseTime.AddMinutes(1)),
+            // A separate thread via ThreadId
+            CreateComment(CommentSeverity.Suggestion, elementId: "elem-C", threadId: "thread-2", createdOn: baseTime)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // 2 threads: MustFix(-20) and Suggestion(0)
+        Assert.Equal(80, result.Score); // 100 - 20
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+        Assert.Equal(1, result.UnresolvedSuggestionCount);
+        Assert.Equal(2, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_ElementIdFallbackWhenNoThreadId()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var baseTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var comments = new List<CommentItemModel>
+        {
+            // Legacy comments: no ThreadId, grouped by ElementId
+            CreateComment(CommentSeverity.ShouldFix, elementId: "legacy-elem-1", threadId: null, createdOn: baseTime),
+            CreateComment(severity: null, elementId: "legacy-elem-1", threadId: null, createdOn: baseTime.AddMinutes(1)),
+            CreateComment(CommentSeverity.MustFix, elementId: "legacy-elem-2", threadId: null, createdOn: baseTime)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // 2 threads: ShouldFix(-10) and MustFix(-20)
+        Assert.Equal(70, result.Score); // 100 - 10 - 20
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+        Assert.Equal(1, result.UnresolvedShouldFixCount);
+        Assert.Equal(2, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_CrossRevisionComments_IncludedInScore()
+    {
+        var revision = CreateRevisionForQualityTest(revisionId: "rev-2");
+        var comments = new List<CommentItemModel>
+        {
+            // Comment from the current revision
+            CreateComment(CommentSeverity.MustFix, apiRevisionId: "rev-2"),
+            // Unresolved comment from a different revision — should still count (visible)
+            CreateComment(CommentSeverity.ShouldFix, apiRevisionId: "rev-1"),
+            // Resolved comment from a different revision — should NOT count
+            CreateComment(CommentSeverity.MustFix, apiRevisionId: "rev-1", isResolved: true)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // Both unresolved comments count regardless of which revision they were created on
+        // 100 - 20 (MustFix) - 10 (ShouldFix) = 70
+        Assert.Equal(70, result.Score);
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+        Assert.Equal(1, result.UnresolvedShouldFixCount);
+        Assert.Equal(2, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_OldStyleNoThreadId_ResolvedByIndividualComment()
+    {
+        // Old-style comments have no ThreadId. Each comment is grouped by ElementId,
+        // so each unique ElementId is a standalone "thread". Resolution is determined
+        // by the individual comment's IsResolved flag.
+        var revision = CreateRevisionForQualityTest();
+        var baseTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var comments = new List<CommentItemModel>
+        {
+            // Resolved old-style comment — should NOT be counted
+            CreateComment(CommentSeverity.MustFix, elementId: "old-elem-1", threadId: null, isResolved: true, createdOn: baseTime),
+            // Unresolved old-style comment — should be counted
+            CreateComment(CommentSeverity.ShouldFix, elementId: "old-elem-2", threadId: null, isResolved: false, createdOn: baseTime),
+            // Another resolved — should NOT be counted
+            CreateComment(CommentSeverity.MustFix, elementId: "old-elem-3", threadId: null, isResolved: true, createdOn: baseTime)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // Only old-elem-2 (ShouldFix, unresolved) counts
+        Assert.Equal(90, result.Score); // 100 - 10
+        Assert.Equal(0, result.UnresolvedMustFixCount);
+        Assert.Equal(1, result.UnresolvedShouldFixCount);
+        Assert.Equal(1, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_NewStyleWithThreadId_MixedResolution_TreatedAsResolved()
+    {
+        // New-style comments share a ThreadId. ResolveConversation marks every comment
+        // in the thread as IsResolved=true. If a reply is later added (e.g., agent reply),
+        // that new comment defaults to IsResolved=false, creating a mixed state.
+        // The thread should still be treated as resolved because the thread was explicitly
+        // resolved — matching the conversations panel behavior (any resolved → thread resolved).
+        var revision = CreateRevisionForQualityTest();
+        var baseTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var comments = new List<CommentItemModel>
+        {
+            // Original comment — resolved when thread was resolved
+            CreateComment(CommentSeverity.MustFix, elementId: "elem-1", threadId: "thread-1", isResolved: true, createdOn: baseTime),
+            // Reply added after resolution — IsResolved defaults to false
+            CreateComment(severity: null, elementId: "elem-1", threadId: "thread-1", isResolved: false, createdOn: baseTime.AddMinutes(5)),
+            // A genuinely unresolved thread for comparison
+            CreateComment(CommentSeverity.ShouldFix, elementId: "elem-2", threadId: "thread-2", createdOn: baseTime)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // thread-1 has a resolved comment → entire thread is resolved → not counted
+        // Only thread-2 (ShouldFix) counts
+        Assert.Equal(90, result.Score); // 100 - 10
+        Assert.Equal(0, result.UnresolvedMustFixCount);
+        Assert.Equal(1, result.UnresolvedShouldFixCount);
+        Assert.Equal(1, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_NewStyleWithThreadId_AllUnresolved_CountedAsActive()
+    {
+        // New-style thread where no comment has been resolved — the thread is active.
+        var revision = CreateRevisionForQualityTest();
+        var baseTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.MustFix, elementId: "elem-1", threadId: "thread-1", isResolved: false, createdOn: baseTime),
+            CreateComment(severity: null, elementId: "elem-1", threadId: "thread-1", isResolved: false, createdOn: baseTime.AddMinutes(5)),
+            CreateComment(severity: null, elementId: "elem-1", threadId: "thread-1", isResolved: false, createdOn: baseTime.AddMinutes(10))
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // All unresolved in thread-1 → thread is active, severity from first comment (MustFix)
+        Assert.Equal(80, result.Score); // 100 - 20
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+        Assert.Equal(1, result.TotalUnresolvedCount);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_NormalizesTimestamps_BeforeSelectingRepresentative()
+    {
+        // Simulate the DateTime.Now vs DateTime.UtcNow bug:
+        // Architect posts MustFix at 10:00 UTC, user replies (no severity) 5 min later
+        // but stored with DateTime.Now (Kind=Local). Without normalization the local
+        // face value may sort before the architect's comment, picking the wrong
+        // thread representative. After normalization both are UTC and the MustFix
+        // comment is correctly selected as the first in the thread.
+        var revision = CreateRevisionForQualityTest();
+        var architectUtcTime = new DateTime(2026, 3, 25, 10, 0, 0, DateTimeKind.Utc);
+        // Construct the local-time equivalent of 10:05 UTC (what DateTime.Now returned)
+        var userReplyActualUtc = new DateTime(2026, 3, 25, 10, 5, 0, DateTimeKind.Utc);
+        var userLocalTime = userReplyActualUtc.ToLocalTime();
+
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.MustFix, elementId: "elem-1", threadId: "thread-1",
+                createdOn: architectUtcTime),
+            CreateComment(severity: null, elementId: "elem-1", threadId: "thread-1",
+                createdOn: userLocalTime)
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        var result = await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // After normalization, the MustFix (10:00 UTC) is the first comment in the thread,
+        // so the thread gets the MustFix severity penalty.
+        Assert.Equal(80, result.Score); // 100 - 20 (MustFix penalty)
+        Assert.Equal(1, result.UnresolvedMustFixCount);
+
+        // Verify the non-UTC comment was persisted back to fix it in the DB
+        _mockCommentsRepository.Verify(
+            r => r.UpsertCommentAsync(It.Is<CommentItemModel>(c => c.CreatedOn.Kind == DateTimeKind.Utc)),
+            Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task GetReviewQualityScoreAsync_AllUtcTimestamps_SkipsNormalization()
+    {
+        var revision = CreateRevisionForQualityTest();
+        var comments = new List<CommentItemModel>
+        {
+            CreateComment(CommentSeverity.ShouldFix, elementId: "elem-1",
+                createdOn: new DateTime(2026, 3, 25, 10, 0, 0, DateTimeKind.Utc))
+        };
+        _mockAPIRevisionsRepository.Setup(x => x.GetAPIRevisionAsync(revision.Id)).ReturnsAsync(revision);
+        _mockCommentsRepository.Setup(x => x.GetCommentsAsync(revision.ReviewId, false, CommentType.APIRevision))
+            .ReturnsAsync(comments);
+
+        await _manager.GetReviewQualityScoreAsync(revision.Id);
+
+        // All timestamps are UTC — no UpsertCommentAsync calls for normalization
+        _mockCommentsRepository.Verify(
+            r => r.UpsertCommentAsync(It.IsAny<CommentItemModel>()), Times.Never);
+    }
+
+    #endregion
+
+    #region AreAPIRevisionsTheSame Tests
+
+    private static APIRevisionListItemModel CreateRevisionWithContentHash(string contentHash) =>
+        new()
+        {
+            Id = "revision-id",
+            ReviewId = "review-id",
+            Files = new List<APICodeFileModel>
+            {
+                new() { FileId = "file-id", FileName = "test_python.json", ContentHash = contentHash }
+            }
+        };
+
+    private static RenderedCodeFile CreateSimpleRenderedCodeFile() =>
+        new(new CodeFile
+        {
+            Name = "test_python.json",
+            Language = "Python",
+            PackageName = "test-package",
+            PackageVersion = "1.0.0"
+        });
+
+    [Fact]
+    public async Task AreAPIRevisionsTheSame_FastPath_ReturnsTrue_WhenHashesMatch()
+    {
+        RenderedCodeFile renderedCodeFile = CreateSimpleRenderedCodeFile();
+        APIRevisionListItemModel revision = CreateRevisionWithContentHash("test-hash-abc");
+
+        _mockCodeFileManager
+            .Setup(x => x.ComputeAPIContentHashAsync(renderedCodeFile.CodeFile))
+            .ReturnsAsync("test-hash-abc");
+
+        bool result = await _manager.AreAPIRevisionsTheSame(revision, renderedCodeFile, incomingContentHash: "test-hash-abc");
+
+        Assert.True(result);
+        _mockCodeFileRepository.Verify(
+            x => x.GetCodeFileAsync(It.IsAny<APIRevisionListItemModel>(), It.IsAny<bool>()),
+            Times.Never,
+            "Fast path should not download the blob");
+    }
+
+    [Fact]
+    public async Task AreAPIRevisionsTheSame_HashMismatch_ReturnsFalseWithoutBlobDownload()
+    {
+     
+        APIRevisionListItemModel revision = CreateRevisionWithContentHash("stored-hash");
+        RenderedCodeFile renderedCodeFile = CreateSimpleRenderedCodeFile();
+
+        _mockCodeFileManager
+            .Setup(x => x.ComputeAPIContentHashAsync(renderedCodeFile.CodeFile))
+            .ReturnsAsync("different-hash");
+
+        bool result = await _manager.AreAPIRevisionsTheSame(revision, renderedCodeFile);
+
+        Assert.False(result);
+        _mockCodeFileRepository.Verify(x => x.GetCodeFileAsync(It.IsAny<APIRevisionListItemModel>(), It.IsAny<bool>()),
+            Times.Never,
+            "Hash mismatch is a definitive 'different' — no blob download required");
+    }
+
+    [Fact]
+    public async Task AreAPIRevisionsTheSame_FastPath_AutoComputesHash_WhenNotProvided()
+    {
+        APIRevisionListItemModel revision = CreateRevisionWithContentHash("test-hash-abc");
+        RenderedCodeFile renderedCodeFile = CreateSimpleRenderedCodeFile();
+
+        _mockCodeFileManager
+            .Setup(x => x.ComputeAPIContentHashAsync(renderedCodeFile.CodeFile))
+            .ReturnsAsync("test-hash-abc");
+
+        // No incomingContentHash supplied — manager should compute it from the renderedCodeFile
+        bool result = await _manager.AreAPIRevisionsTheSame(revision, renderedCodeFile);
+
+        Assert.True(result);
+        _mockCodeFileRepository.Verify(
+            x => x.GetCodeFileAsync(It.IsAny<APIRevisionListItemModel>(), It.IsAny<bool>()),
+            Times.Never, "Should not download blob when storedHash is set");
+    }
+
+    [Fact]
+    public async Task AreAPIRevisionsTheSame_SlowPath_BackfillsHash_WhenStoredHashIsNull()
+    {
+        APIRevisionListItemModel revision = CreateRevisionWithContentHash(null);
+        RenderedCodeFile blobCodeFile = CreateSimpleRenderedCodeFile();
+        RenderedCodeFile incomingRenderedCodeFile = CreateSimpleRenderedCodeFile();
+
+        _mockCodeFileRepository
+            .Setup(x => x.GetCodeFileAsync(It.IsAny<APIRevisionListItemModel>(), false))
+            .ReturnsAsync(blobCodeFile);
+
+        _mockCodeFileManager
+            .Setup(x => x.AreAPICodeFilesTheSame(blobCodeFile, incomingRenderedCodeFile))
+            .Returns(true);
+
+        _mockCodeFileManager
+            .Setup(x => x.ComputeAPIContentHashAsync(blobCodeFile.CodeFile))
+            .ReturnsAsync("backfilled-hash");
+
+        _mockAPIRevisionsRepository
+            .Setup(x => x.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>()))
+            .Returns(Task.CompletedTask);
+
+        bool result = await _manager.AreAPIRevisionsTheSame(revision, incomingRenderedCodeFile);
+
+        Assert.True(result);
+        Assert.Equal("backfilled-hash", revision.Files[0].ContentHash);
+        _mockAPIRevisionsRepository.Verify(
+            x => x.UpsertAPIRevisionAsync(It.Is<APIRevisionListItemModel>(r => r.Files[0].ContentHash == "backfilled-hash")),
+            Times.Once,
+            "Lazy backfill should persist the hash so future calls use the fast path");
+    }
+
+    [Fact]
+    public async Task AreAPIRevisionsTheSame_SlowPath_ReturnsFalse_WhenBlobThrowsJsonException()
+    {
+        APIRevisionListItemModel revision = CreateRevisionWithContentHash(null);
+        RenderedCodeFile renderedCodeFile = CreateSimpleRenderedCodeFile();
+
+        _mockCodeFileRepository
+            .Setup(x => x.GetCodeFileAsync(It.IsAny<APIRevisionListItemModel>(), false))
+            .ThrowsAsync(new JsonException("corrupt blob"));
+
+        bool result = await _manager.AreAPIRevisionsTheSame(revision, renderedCodeFile);
+
+        Assert.False(result);
+        _mockAPIRevisionsRepository.Verify(
+            x => x.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>()),
+            Times.Never,
+            "Should not upsert when blob read fails");
+    }
+
+    [Fact]
+    public async Task AreAPIRevisionsTheSame_ReturnsTrue_WhenSameApiSurface_AndPackageVersionNotChecked()
+    {
+        // Stored revision has PackageVersion "1.0.0"; incoming has "2.0.0".
+        var revisionFile = new APICodeFileModel
+        {
+            FileId = "file-id",
+            FileName = "test_python.json",
+            ContentHash = "api-surface-hash",
+            PackageVersion = "1.0.0"
+        };
+        var revision = new APIRevisionListItemModel
+        {
+            Id = "revision-id", ReviewId = "review-id", Files = new List<APICodeFileModel> { revisionFile }
+        };
+        var incomingFile = new RenderedCodeFile(new CodeFile
+        {
+            Name = "test_python.json",
+            Language = "Python",
+            PackageName = "test-package",
+            PackageVersion = "2.0.0" // different version, same surface
+        });
+
+        _mockCodeFileManager
+            .Setup(x => x.ComputeAPIContentHashAsync(incomingFile.CodeFile))
+            .ReturnsAsync("api-surface-hash"); // same hash because surface is identical
+
+        bool result = await _manager.AreAPIRevisionsTheSame(revision, incomingFile, false);
+
+        Assert.True(result);
+        _mockCodeFileRepository.Verify(
+            x => x.GetCodeFileAsync(It.IsAny<APIRevisionListItemModel>(), It.IsAny<bool>()),
+            Times.Never,
+            "Version-only difference should not trigger a blob download");
+    }
+
+    [Fact]
+    public async Task
+        AreAPIRevisionsTheSame_ReturnsFalse_WhenSameApiSurface_AndPackageVersionDiffers_WithConsiderVersion()
+    {
+        var revisionFile = new APICodeFileModel
+        {
+            FileId = "file-id",
+            FileName = "test_python.json",
+            ContentHash = "api-surface-hash",
+            PackageVersion = "1.0.0"
+        };
+        var revision = new APIRevisionListItemModel
+        {
+            Id = "revision-id", ReviewId = "review-id", Files = new List<APICodeFileModel> { revisionFile }
+        };
+        var incomingFile = new RenderedCodeFile(new CodeFile
+        {
+            Name = "test_python.json", Language = "Python", PackageName = "test-package", PackageVersion = "2.0.0"
+        });
+
+        _mockCodeFileManager
+            .Setup(x => x.ComputeAPIContentHashAsync(incomingFile.CodeFile))
+            .ReturnsAsync("api-surface-hash");
+
+        bool result = await _manager.AreAPIRevisionsTheSame(revision, incomingFile, true);
+
+        Assert.False(result);
+        _mockCodeFileRepository.Verify(
+            x => x.GetCodeFileAsync(It.IsAny<APIRevisionListItemModel>(), It.IsAny<bool>()),
+            Times.Never);
+    }
+
+    #endregion
+
+    #region CreateAPIRevisionAsync_PreParsed Tests
+
+    [Fact]
+    public async Task CreateAPIRevisionAsync_WithPreParsedCodeFile_DoesNotParseAgain()
+    {
+        // Arrange
+        var user = CreateTestUser("testuser");
+        var review = new ReviewListItemModel
+        {
+            Id = "review-1",
+            PackageName = "test-package",
+            Language = "Python",
+            ChangeHistory = new List<ReviewChangeHistoryModel>()
+        };
+
+        var preParsedCodeFile = new CodeFile
+        {
+            Name = "test.whl",
+            Language = "Python",
+            PackageName = "test-package",
+            PackageVersion = "1.0.0"
+        };
+
+        var preParsedMemoryStream = new MemoryStream();
+        var codeFileModel = new APICodeFileModel { FileId = "file-1", Language = "Python" };
+
+        SetupSignalRMocks();
+
+        // Setup: CreateReviewCodeFileModel should be called with the pre-parsed data
+        _mockCodeFileManager
+            .Setup(m => m.CreateReviewCodeFileModel(It.IsAny<string>(), preParsedMemoryStream, preParsedCodeFile))
+            .ReturnsAsync(codeFileModel);
+
+        _mockAPIRevisionsRepository
+            .Setup(x => x.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>()))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        var result = await _manager.CreateAPIRevisionAsync(
+            user: user, review: review, file: null, filePath: "test.whl",
+            language: "Python", label: "test",
+            preParsedCodeFile: preParsedCodeFile, preParsedMemoryStream: preParsedMemoryStream);
+
+        // Assert: CreateReviewCodeFileModel was called (reusing pre-parsed data)
+        _mockCodeFileManager.Verify(
+            m => m.CreateReviewCodeFileModel(It.IsAny<string>(), preParsedMemoryStream, preParsedCodeFile),
+            Times.Once);
+
+        // Assert: CreateCodeFileAsync was NOT called (no re-parsing)
+        _mockCodeFileManager.Verify(
+            m => m.CreateCodeFileAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<Stream>(), It.IsAny<string>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task CreateAPIRevisionAsync_WithoutPreParsedCodeFile_ParsesFile()
+    {
+        // Arrange
+        var user = CreateTestUser("testuser");
+        var review = new ReviewListItemModel
+        {
+            Id = "review-1",
+            PackageName = "test-package",
+            Language = "Python",
+            ChangeHistory = new List<ReviewChangeHistoryModel>()
+        };
+
+        var codeFileModel = new APICodeFileModel { FileId = "file-1", Language = "Python" };
+        var codeFile = new CodeFile { Name = "test.whl", Language = "Python", PackageName = "test-package" };
+
+        SetupSignalRMocks();
+
+        // Setup: CreateCodeFileAsync should be called (normal parsing path)
+        _mockCodeFileManager
+            .Setup(m => m.CreateCodeFileAsync(It.IsAny<string>(), "test.whl", true, null, "Python"))
+            .ReturnsAsync(codeFileModel);
+
+        _mockCodeFileRepository
+            .Setup(m => m.GetCodeFileFromStorageAsync(It.IsAny<string>(), It.IsAny<string>()))
+            .ReturnsAsync(codeFile);
+
+        _mockAPIRevisionsRepository
+            .Setup(x => x.UpsertAPIRevisionAsync(It.IsAny<APIRevisionListItemModel>()))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        var result = await _manager.CreateAPIRevisionAsync(
+            user: user, review: review, file: null, filePath: "test.whl",
+            language: "Python", label: "test");
+
+        // Assert: CreateCodeFileAsync WAS called (normal path)
+        _mockCodeFileManager.Verify(
+            m => m.CreateCodeFileAsync(It.IsAny<string>(), "test.whl", true, null, "Python"),
+            Times.Once);
+
+        // Assert: CreateReviewCodeFileModel was NOT called directly
+        _mockCodeFileManager.Verify(
+            m => m.CreateReviewCodeFileModel(It.IsAny<string>(), It.IsAny<MemoryStream>(), It.IsAny<CodeFile>()),
+            Times.Never);
     }
 
     #endregion

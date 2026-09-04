@@ -1,0 +1,8 @@
+{
+  "name": "azure-typespec-author-benchmark",
+  "private": true,
+  "description": "CI-only npm project that pins @typespec/compiler for reproducible benchmark pipeline runs; not published.",
+  "devDependencies": {
+    "@typespec/compiler": "1.13.0"
+  }
+}

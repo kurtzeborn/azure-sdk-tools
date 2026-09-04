@@ -4,138 +4,299 @@ using System.IO;
 using System.Linq;
 using System.Security.Claims;
 using System.Threading.Tasks;
-using ApiView;
+using APIView;
 using APIViewWeb.LeanModels;
 using APIViewWeb.Managers.Interfaces;
 using APIViewWeb.Models;
+using Microsoft.ApplicationInsights;
 
 namespace APIViewWeb.Managers;
 
-    public class AutoReviewService : IAutoReviewService
-    {
-        private readonly IReviewManager _reviewManager;
-        private readonly IAPIRevisionsManager _apiRevisionsManager;
-        private readonly ICommentsManager _commentsManager;
+public class AutoReviewService : IAutoReviewService
+{
+    private readonly IReviewManager _reviewManager;
+    private readonly IAPIRevisionsManager _apiRevisionsManager;
+    private readonly ICommentsManager _commentsManager;
+    private readonly IProjectsManager _projectsManager;
+    private readonly ICodeFileManager _codeFileManager;
+    private readonly IAPIVersionsManager _apiVersionsManager;
+    private readonly TelemetryClient _telemetryClient;
 
-        public AutoReviewService(
-            IReviewManager reviewManager,
-            IAPIRevisionsManager apiRevisionsManager,
-            ICommentsManager commentsManager)
+    public AutoReviewService(
+        IReviewManager reviewManager,
+        IAPIRevisionsManager apiRevisionsManager,
+        ICommentsManager commentsManager,
+        IProjectsManager projectsManager,
+        ICodeFileManager codeFileManager,
+        IAPIVersionsManager apiVersionsManager,
+        TelemetryClient telemetryClient)
+    {
+        _reviewManager = reviewManager;
+        _apiRevisionsManager = apiRevisionsManager;
+        _commentsManager = commentsManager;
+        _projectsManager = projectsManager;
+        _codeFileManager = codeFileManager;
+        _apiVersionsManager = apiVersionsManager;
+        _telemetryClient = telemetryClient;
+    }
+
+    public async Task<(ReviewListItemModel review, APIRevisionListItemModel apiRevision)> CreateAutomaticRevisionAsync(
+        ClaimsPrincipal user,
+        CodeFile codeFile,
+        string label,
+        string originalName,
+        MemoryStream memoryStream,
+        string packageType,
+        bool compareAllRevisions = false,
+        string sourceBranch = null)
+    {
+        // Parse package type once at the beginning
+        var parsedPackageType = !string.IsNullOrEmpty(packageType) && Enum.TryParse<PackageType>(packageType, true, out var result) ? (PackageType?)result : null;
+        var review = await _reviewManager.GetReviewAsync(packageName: codeFile.PackageName, language: codeFile.Language, isClosed: null);
+        var apiRevision = default(APIRevisionListItemModel);
+        var renderedCodeFile = new RenderedCodeFile(codeFile);
+        IEnumerable<APIRevisionListItemModel> apiRevisions = new List<APIRevisionListItemModel>();
+        string incomingContentHash = null;
+        if (review != null)
         {
-            _reviewManager = reviewManager;
-            _apiRevisionsManager = apiRevisionsManager;
-            _commentsManager = commentsManager;
+            // Update package type if provided from controller parameter and not already set
+            if (parsedPackageType.HasValue && !review.PackageType.HasValue)
+            {
+                review.PackageType = parsedPackageType;
+                review = await _reviewManager.UpdateReviewAsync(review);
+            }
+
+            apiRevisions = await _apiRevisionsManager.GetAPIRevisionsAsync(review.Id);
+            if (apiRevisions.Any())
+            {
+                apiRevisions = apiRevisions.OrderByDescending(r => r.CreatedOn);
+                incomingContentHash = await _codeFileManager.ComputeAPIContentHashAsync(codeFile);
+
+                APIVersionModel incomingVersionModel = null;
+                if (!string.IsNullOrEmpty(codeFile.PackageVersion))
+                {
+                    incomingVersionModel = await _apiVersionsManager.GetOrCreateVersionAsync(review.Id, codeFile.PackageVersion, codeFile.Language);
+                }
+
+                // Scope to automatic revisions for the same logical version as the incoming upload.
+                var automaticRevisions = apiRevisions
+                    .Where(r => r.APIRevisionType == APIRevisionType.Automatic
+                        && (incomingVersionModel == null || r.APIVersionId == incomingVersionModel.Id || string.IsNullOrEmpty(r.APIVersionId)))
+                    .ToList();
+                if (automaticRevisions.Count > 0)
+                {
+                    // Revision identity and approval inheritance are separate decisions. Repeated uploads of the
+                    // same package version and API surface reuse the revision so SkipDiff token changes are retained.
+                    // Released revisions are immutable. Different package versions fall through to creation and may
+                    // inherit approval later when their API surface matches an approved revision.
+                    foreach (var matchingVersionRevision in automaticRevisions.Where(r => r.PackageVersion == codeFile.PackageVersion))
+                    {
+                        if (await _apiRevisionsManager.AreAPIRevisionsTheSame(matchingVersionRevision, renderedCodeFile, true, incomingContentHash))
+                        {
+                            if (matchingVersionRevision.IsReleased)
+                            {
+                                TrackCarryForwardEvent("APIViewAutomaticRevisionExistingReleasedMatch", review, matchingVersionRevision, matchingVersionRevision, incomingContentHash, true);
+                                return (review, matchingVersionRevision);
+                            }
+
+                            apiRevision = await UpdateAutomaticAPIRevisionCodeFile(
+                                matchingVersionRevision,
+                                label,
+                                originalName,
+                                memoryStream,
+                                codeFile,
+                                sourceBranch,
+                                incomingVersionModel?.Id);
+                            TrackCarryForwardEvent("APIViewAutomaticRevisionExistingMatchUpdated", review, apiRevision, matchingVersionRevision, incomingContentHash, true);
+                            break;
+                        }
+                    }
+
+                    if (apiRevision == null)
+                    {
+                        var comments = await _commentsManager.GetCommentsAsync(review.Id);
+                        var revisionIdsWithComments = comments.Select(c => c.APIRevisionId).ToHashSet();
+
+                        // Find the newest pending automatic revision to replace when the API surface changed.
+                        var latestAutomaticAPIRevision = automaticRevisions.FirstOrDefault(
+                            r => !r.IsApproved && !r.IsReleased && !revisionIdsWithComments.Contains(r.Id)
+                            && r.PackageVersion == codeFile.PackageVersion);
+
+                        if (latestAutomaticAPIRevision != null)
+                        {
+                            apiRevision = await UpdateAutomaticAPIRevisionCodeFile(
+                                latestAutomaticAPIRevision,
+                                label,
+                                originalName,
+                                memoryStream,
+                                codeFile,
+                                sourceBranch,
+                                incomingVersionModel?.Id);
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            review = await _reviewManager.CreateReviewAsync(packageName: codeFile.PackageName, language: codeFile.Language, isClosed: false, packageType: parsedPackageType, crossLanguagePackageId: codeFile.CrossLanguagePackageId);
         }
 
-        public async Task<(ReviewListItemModel review, APIRevisionListItemModel apiRevision)> CreateAutomaticRevisionAsync(
-            ClaimsPrincipal user,
-            CodeFile codeFile,
-            string label,
-            string originalName,
-            MemoryStream memoryStream,
-            string packageType,
-            bool compareAllRevisions = false,
-            string sourceBranch = null)
+        if (apiRevision == null)
         {
-            // Parse package type once at the beginning
-            var parsedPackageType = !string.IsNullOrEmpty(packageType) && Enum.TryParse<PackageType>(packageType, true, out var result) ? (PackageType?)result : null;
-            
-            var createNewRevision = true;
-            var review = await _reviewManager.GetReviewAsync(packageName: codeFile.PackageName, language: codeFile.Language, isClosed: null);
-            var apiRevision = default(APIRevisionListItemModel);
-            var renderedCodeFile = new RenderedCodeFile(codeFile);
-            IEnumerable<APIRevisionListItemModel> apiRevisions = new List<APIRevisionListItemModel>();
+            apiRevision = await _apiRevisionsManager.CreateAPIRevisionAsync(userName: user.GetGitHubLogin(), reviewId: review.Id, apiRevisionType: APIRevisionType.Automatic, label: label, memoryStream: memoryStream, codeFile: codeFile, originalName: originalName, sourceBranch: sourceBranch);
+        }
 
-            if (review != null)
+        await _projectsManager.TryLinkReviewToProjectAsync(user.GetGitHubLogin(), review);
+
+        if (apiRevision != null && apiRevisions.Any())
+        {
+            // Only revisions carrying approval or auto-generated comments are worth comparing
+            var candidates = apiRevisions.Where(r => r.Id != apiRevision.Id && (r.IsApproved || r.HasAutoGeneratedComments)).ToList();
+            TrackCarryForwardEvent("APIViewAutomaticRevisionCarryForwardStarted", review, apiRevision, null, incomingContentHash, null, candidates.Count);
+            foreach (var apiRev in candidates)
             {
-                // Update package type if provided from controller parameter and not already set
-                if (parsedPackageType.HasValue && !review.PackageType.HasValue)
+                if (apiRevision.IsApproved && apiRevision.HasAutoGeneratedComments)
                 {
-                    review.PackageType = parsedPackageType;
-                    review = await _reviewManager.UpdateReviewAsync(review);
+                    TrackCarryForwardEvent("APIViewAutomaticRevisionCarryForwardStopped", review, apiRevision, apiRev, incomingContentHash, null, candidates.Count);
+                    break;
                 }
 
-                apiRevisions = await _apiRevisionsManager.GetAPIRevisionsAsync(review.Id);
-                if (apiRevisions.Any())
+                try
                 {
-                    apiRevisions = apiRevisions.OrderByDescending(r => r.CreatedOn);
-
-                    // Delete pending apiRevisions if it is not in approved state before adding new revision
-                    // This is to keep only one pending revision since last approval or from initial review revision
-                    var automaticRevisions = apiRevisions.Where(r => r.APIRevisionType == APIRevisionType.Automatic);
-                    if (automaticRevisions.Any())
+                    bool isSameAPI = await _apiRevisionsManager.AreAPIRevisionsTheSame(apiRev, renderedCodeFile, incomingContentHash: incomingContentHash);
+                    TrackCarryForwardEvent("APIViewAutomaticRevisionCarryForwardCandidateCompared", review, apiRevision, apiRev, incomingContentHash, isSameAPI, candidates.Count);
+                    if (isSameAPI)
                     {
-                        var automaticRevisionsQueue = new Queue<APIRevisionListItemModel>(automaticRevisions);
-                        var comments = await _commentsManager.GetCommentsAsync(review.Id);
-                        APIRevisionListItemModel latestAutomaticAPIRevision = null;
-
-                        while (automaticRevisionsQueue.Any())
-                        {
-                            latestAutomaticAPIRevision = automaticRevisionsQueue.Dequeue();
-
-                            // Check if we should keep this revision
-                            if (latestAutomaticAPIRevision.IsApproved ||
-                                latestAutomaticAPIRevision.IsReleased ||
-                                await _apiRevisionsManager.AreAPIRevisionsTheSame(latestAutomaticAPIRevision, renderedCodeFile) ||
-                                comments.Any(c => latestAutomaticAPIRevision.Id == c.APIRevisionId))
-                            {
-                                break;
-                            }
-
-                            // Delete this revision
-                            await _apiRevisionsManager.SoftDeleteAPIRevisionAsync(apiRevision: latestAutomaticAPIRevision, notes: "Deleted by Automatic Review Creation...");
-                            latestAutomaticAPIRevision = null;  // Mark as consumed
-                        }
-
-                        // We should compare against only latest revision when calling this API from scheduled CI runs
-                        // But any manual pipeline run at release time should compare against all approved revisions to ensure hotfix release doesn't have API change
-                        // If review surface doesn't match with any approved revisions then we will create new revision if it doesn't match pending latest revision
-
-                        bool considerPackageVersion = !String.IsNullOrWhiteSpace(codeFile.PackageVersion);
-
-                        if (compareAllRevisions)
-                        {
-                            foreach (var approvedAPIRevision in automaticRevisions.Where(r => r.IsApproved))
-                            {
-                                if (await _apiRevisionsManager.AreAPIRevisionsTheSame(approvedAPIRevision, renderedCodeFile, considerPackageVersion))
-                                {
-                                    return (review, approvedAPIRevision);
-                                }
-                            }
-                        }
-
-                        // Only reuse latestAutomaticAPIRevision if one was kept
-                        if (latestAutomaticAPIRevision != null &&
-                            await _apiRevisionsManager.AreAPIRevisionsTheSame(latestAutomaticAPIRevision, renderedCodeFile, considerPackageVersion))
-                        {
-                            apiRevision = latestAutomaticAPIRevision;
-                            createNewRevision = false;
-                        }
-                    }
-                }
-            }
-            else
-            {
-                review = await _reviewManager.CreateReviewAsync(packageName: codeFile.PackageName, language: codeFile.Language, isClosed: false, packageType: parsedPackageType, crossLanguagePackageId: codeFile.CrossLanguagePackageId);
-            }
-            
-            if (createNewRevision)
-            {
-                apiRevision = await _apiRevisionsManager.CreateAPIRevisionAsync(userName: user.GetGitHubLogin(), reviewId: review.Id, apiRevisionType: APIRevisionType.Automatic, label: label, memoryStream: memoryStream, codeFile: codeFile, originalName: originalName, sourceBranch: sourceBranch);
-            }
-
-            // TODO: await _projectsManager.TryLinkReviewToProjectAsync(user, review);
-
-            if (apiRevision != null && apiRevisions.Any())
-            {
-                foreach (var apiRev in apiRevisions)
-                {
-                    if (await _apiRevisionsManager.AreAPIRevisionsTheSame(apiRev, renderedCodeFile))
-                    {
+                        bool wasApproved = apiRevision.IsApproved;
+                        bool hadAutoGeneratedComments = apiRevision.HasAutoGeneratedComments;
                         await _apiRevisionsManager.CarryForwardRevisionDataAsync(targetRevision: apiRevision, sourceRevision: apiRev);
+                        TrackCarryForwardEvent("APIViewAutomaticRevisionCarryForwardApplied", review, apiRevision, apiRev, incomingContentHash, true, candidates.Count, wasApproved, hadAutoGeneratedComments);
                     }
                 }
+                catch (Exception ex)
+                {
+                    _telemetryClient.TrackException(ex, CreateCarryForwardProperties(review, apiRevision, apiRev, incomingContentHash, null, candidates.Count));
+                    throw;
+                }
             }
-            return (review, apiRevision);
+        }
+        return (review, apiRevision);
+    }
+
+    private void TrackCarryForwardEvent(
+        string eventName,
+        ReviewListItemModel review,
+        APIRevisionListItemModel targetRevision,
+        APIRevisionListItemModel sourceRevision,
+        string incomingContentHash,
+        bool? isSameAPI,
+        int? candidateCount = null,
+        bool? targetWasApproved = null,
+        bool? targetHadAutoGeneratedComments = null)
+    {
+        _telemetryClient.TrackEvent(eventName, CreateCarryForwardProperties(
+            review,
+            targetRevision,
+            sourceRevision,
+            incomingContentHash,
+            isSameAPI,
+            candidateCount,
+            targetWasApproved,
+            targetHadAutoGeneratedComments));
+    }
+
+    private static Dictionary<string, string> CreateCarryForwardProperties(
+        ReviewListItemModel review,
+        APIRevisionListItemModel targetRevision,
+        APIRevisionListItemModel sourceRevision,
+        string incomingContentHash,
+        bool? isSameAPI,
+        int? candidateCount = null,
+        bool? targetWasApproved = null,
+        bool? targetHadAutoGeneratedComments = null)
+    {
+        var properties = new Dictionary<string, string>();
+        AddProperty(properties, "reviewId", review?.Id);
+        AddProperty(properties, "packageName", review?.PackageName ?? targetRevision?.PackageName);
+        AddProperty(properties, "language", review?.Language ?? targetRevision?.Language);
+        AddProperty(properties, "targetRevisionId", targetRevision?.Id);
+        AddProperty(properties, "targetRevisionType", targetRevision?.APIRevisionType.ToString());
+        AddProperty(properties, "targetPackageVersion", targetRevision?.PackageVersion ?? targetRevision?.Files?.FirstOrDefault()?.PackageVersion);
+        AddProperty(properties, "targetAPIVersionId", targetRevision?.APIVersionId);
+        AddProperty(properties, "targetIsApproved", targetRevision?.IsApproved.ToString());
+        AddProperty(properties, "targetHasAutoGeneratedComments", targetRevision?.HasAutoGeneratedComments.ToString());
+        AddProperty(properties, "targetWasApproved", targetWasApproved?.ToString());
+        AddProperty(properties, "targetHadAutoGeneratedComments", targetHadAutoGeneratedComments?.ToString());
+        AddProperty(properties, "sourceRevisionId", sourceRevision?.Id);
+        AddProperty(properties, "sourceRevisionType", sourceRevision?.APIRevisionType.ToString());
+        AddProperty(properties, "sourcePackageVersion", sourceRevision?.PackageVersion ?? sourceRevision?.Files?.FirstOrDefault()?.PackageVersion);
+        AddProperty(properties, "sourceAPIVersionId", sourceRevision?.APIVersionId);
+        AddProperty(properties, "sourceIsApproved", sourceRevision?.IsApproved.ToString());
+        AddProperty(properties, "sourceHasAutoGeneratedComments", sourceRevision?.HasAutoGeneratedComments.ToString());
+        AddProperty(properties, "sourceContentHash", sourceRevision?.Files?.FirstOrDefault()?.ContentHash);
+        AddProperty(properties, "incomingContentHash", incomingContentHash);
+        AddProperty(properties, "isSameAPI", isSameAPI?.ToString());
+        AddProperty(properties, "candidateCount", candidateCount?.ToString());
+        return properties;
+    }
+
+    private static void AddProperty(Dictionary<string, string> properties, string key, string value)
+    {
+        if (!string.IsNullOrEmpty(value))
+        {
+            properties[key] = value;
         }
     }
+
+    private async Task<APIRevisionListItemModel> UpdateAutomaticAPIRevisionCodeFile(
+        APIRevisionListItemModel apiRevision,
+        string label,
+        string originalName,
+        MemoryStream memoryStream,
+        CodeFile codeFile,
+        string sourceBranch,
+        string apiVersionId)
+    {
+        var previousCodeFileModel = apiRevision.Files.FirstOrDefault();
+        var codeFileModel = await _codeFileManager.CreateReviewCodeFileModel(apiRevision.Id, memoryStream, codeFile);
+        var fileName = !string.IsNullOrEmpty(originalName) ? originalName : apiRevision.Files.FirstOrDefault()?.FileName;
+        if (!string.IsNullOrEmpty(fileName))
+        {
+            codeFileModel.FileName = fileName;
+        }
+
+        if (apiRevision.Files.Any())
+        {
+            apiRevision.Files[0] = codeFileModel;
+        }
+        else
+        {
+            apiRevision.Files.Add(codeFileModel);
+        }
+
+        apiRevision.PackageName = codeFile.PackageName;
+        apiRevision.Language = codeFile.Language;
+        apiRevision.Label = label;
+        if (!string.IsNullOrEmpty(sourceBranch))
+        {
+            apiRevision.SourceBranch = sourceBranch;
+        }
+        apiRevision.LastUpdatedOn = DateTime.UtcNow;
+        apiRevision.IsDeleted = false;
+
+        if (!string.IsNullOrEmpty(apiVersionId))
+        {
+            apiRevision.APIVersionId = apiVersionId;
+        }
+
+        await _apiRevisionsManager.UpdateAPIRevisionAsync(apiRevision);
+
+        if (previousCodeFileModel != null && previousCodeFileModel.FileId != codeFileModel.FileId)
+        {
+            await _codeFileManager.TryDeleteCodeFileModelAsync(apiRevision.Id, previousCodeFileModel);
+        }
+
+        return apiRevision;
+    }
+}

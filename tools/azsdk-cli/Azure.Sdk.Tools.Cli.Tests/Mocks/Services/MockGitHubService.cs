@@ -1,49 +1,52 @@
 using Octokit;
+using Azure.Sdk.Tools.Cli.Models;
 using Azure.Sdk.Tools.Cli.Services;
 
 namespace Azure.Sdk.Tools.Cli.Tests.Mocks.Services
 {
     public class MockGitHubService : IGitHubService
     {
-        public Task<CreateBranchStatus> CreateBranchAsync(string repoOwner, string repoName, string branchName, string baseBranchName = "main")
+        public string GetAuthToken() => "mock-github-token";
+
+        public Task<CreateBranchStatus> CreateBranchAsync(string repoOwner, string repoName, string branchName, string baseBranchName = "main", CancellationToken ct = default)
         {
             // Default mock: creating a branch succeeds
             return Task.FromResult(CreateBranchStatus.Created);
         }
 
-        public Task<bool> IsExistingBranchAsync(string repoOwner, string repoName, string branchName)
+        public Task<bool> IsExistingBranchAsync(string repoOwner, string repoName, string branchName, CancellationToken ct)
         {
             // Default mock: branch does not exist
             return Task.FromResult(false);
         }
 
 
-        public Task<User> GetGitUserDetailsAsync()
+        public Task<User> GetGitUserDetailsAsync(CancellationToken ct)
         {
             // Create a simple mock user - we'll use reflection to set properties if needed
             var user = CreateMockUser("testuser", 123456);
             return Task.FromResult(user);
         }
 
-        public Task<List<string>> GetPullRequestChecksAsync(int pullRequestNumber, string repoName, string repoOwner)
+        public Task<List<string>> GetPullRequestChecksAsync(int pullRequestNumber, string repoName, string repoOwner, CancellationToken ct)
         {
             // Default: no checks
             return Task.FromResult(new List<string>());
         }
 
-        public Task<PullRequest> GetPullRequestAsync(string repoOwner, string repoName, int pullRequestNumber)
+        public Task<PullRequest> GetPullRequestAsync(string repoOwner, string repoName, int pullRequestNumber, CancellationToken ct)
         {
             // Create a minimal pull request mock
             var pr = CreateMockPullRequest(repoOwner, repoName, pullRequestNumber);
             return Task.FromResult(pr);
         }
 
-        public Task<string> GetGitHubParentRepoUrlAsync(string owner, string repoName)
+        public Task<string> GetGitHubParentRepoUrlAsync(string owner, string repoName, CancellationToken ct)
         {
             return Task.FromResult($"https://github.com/{owner}/{repoName}");
         }
 
-        public Task<PullRequestResult> CreatePullRequestAsync(string repoName, string repoOwner, string baseBranch, string headBranch, string title, string body, bool draft = true)
+        public Task<PullRequestResult> CreatePullRequestAsync(string repoName, string repoOwner, string baseBranch, string headBranch, string title, string body, bool draft = true, CancellationToken ct = default)
         {
             // Return a simple successful PullRequestResult
             var url = $"https://example/{repoOwner}/{repoName}/pulls/{Guid.NewGuid():N}";
@@ -54,7 +57,7 @@ namespace Azure.Sdk.Tools.Cli.Tests.Mocks.Services
             });
         }
 
-        public Task<List<string>> GetPullRequestCommentsAsync(string repoOwner, string repoName, int pullRequestNumber)
+        public Task<List<string>> GetPullRequestCommentsAsync(string repoOwner, string repoName, int pullRequestNumber, CancellationToken ct)
         {
             var comments = new List<string>
             {
@@ -64,46 +67,46 @@ namespace Azure.Sdk.Tools.Cli.Tests.Mocks.Services
             return Task.FromResult(comments);
         }
 
-        public Task<PullRequest?> GetPullRequestForBranchAsync(string repoOwner, string repoName, string remoteBranch)
+        public Task<PullRequest?> GetPullRequestForBranchAsync(string repoOwner, string repoName, string remoteBranch, CancellationToken ct)
         {
             // Default: no existing PR for branch
             return Task.FromResult<PullRequest?>(null);
         }
 
-        public Task<IReadOnlyList<PullRequest?>> SearchPullRequestsByTitleAsync(string repoOwner, string repoName, string titleSearchTerm, ItemState? state = ItemState.Open)
+        public Task<IReadOnlyList<PullRequest?>> SearchPullRequestsByTitleAsync(string repoOwner, string repoName, string titleSearchTerm, ItemState? state = ItemState.Open, CancellationToken ct = default)
         {
             // Default: no matching PRs
             return Task.FromResult<IReadOnlyList<PullRequest?>>(new List<PullRequest?>().AsReadOnly());
         }
 
-        public Task<Issue> GetIssueAsync(string repoOwner, string repoName, int issueNumber)
+        public Task<Issue> GetIssueAsync(string repoOwner, string repoName, int issueNumber, CancellationToken ct)
         {
             var issue = CreateMockIssue(repoOwner, repoName, issueNumber);
             return Task.FromResult(issue);
         }
 
-        public Task UpdatePullRequestAsync(string repoOwner, string repoName, int pullRequestNumber, string title, string body, ItemState state)
+        public Task UpdatePullRequestAsync(string repoOwner, string repoName, int pullRequestNumber, string title, string body, ItemState state, CancellationToken ct)
         {
             return Task.CompletedTask;
         }
 
-        public Task<IReadOnlyList<RepositoryContent>?> GetContentsAsync(string owner, string repoName, string path)
+        public Task<IReadOnlyList<RepositoryContent>?> GetContentsAsync(string owner, string repoName, string path, CancellationToken ct)
         {
             return Task.FromResult<IReadOnlyList<RepositoryContent>?>(new List<RepositoryContent>().AsReadOnly());
         }
 
-        public Task<IReadOnlyList<RepositoryContent>?> GetContentsAsync(string owner, string repoName, string path, string? branch = null)
+        public Task<IReadOnlyList<RepositoryContent>?> GetContentsAsync(string owner, string repoName, string path, string? branch = null, CancellationToken ct = default)
         {
             return Task.FromResult<IReadOnlyList<RepositoryContent>?>(new List<RepositoryContent>().AsReadOnly());
         }
 
-        public Task UpdateFileAsync(string owner, string repoName, string path, string message, string content, string sha, string branch)
+        public Task UpdateFileAsync(string owner, string repoName, string path, string message, string content, string sha, string branch, CancellationToken ct)
         {
             // No-op for tests
             return Task.CompletedTask;
         }
 
-        public Task<RepositoryContent> GetContentsSingleAsync(string owner, string repoName, string path, string? branch = null)
+        public Task<RepositoryContent> GetContentsSingleAsync(string owner, string repoName, string path, string? branch = null, CancellationToken ct = default)
         {
             // Return a simple RepositoryContent for the requested path
             var fileName = Path.GetFileName(path);
@@ -111,11 +114,11 @@ namespace Azure.Sdk.Tools.Cli.Tests.Mocks.Services
             return Task.FromResult(content);
         }
 
-        public Task<HashSet<string>?> GetPublicOrgMembership(string username)
+        public Task<HashSet<string>?> GetPublicOrgMembership(string username, CancellationToken ct)
         {
             throw new Exception("Not implemented.");
         }
-        public Task<bool> HasWritePermission(string owner, string repo, string username)
+        public Task<bool> HasWritePermission(string owner, string repo, string username, CancellationToken ct)
         {
             return Task.FromResult(true);
         }
@@ -325,36 +328,96 @@ namespace Azure.Sdk.Tools.Cli.Tests.Mocks.Services
             );
         }
 
-        public Task<Issue> CreateIssueAsync(string repoOwner, string repoName, string title, string body, List<string>? assignees = null)
+        public Task<Issue> CreateIssueAsync(string repoOwner, string repoName, string title, string body, List<string>? assignees = null, CancellationToken ct = default)
         {
             // Create a mock issue
             var issue = CreateMockIssue(repoOwner, repoName, 1);
             return Task.FromResult(issue);
         }
 
-        public Task<string?> GetPullRequestHeadSha(string repoOwner, string repoName, int pullRequestNumber)
+        public Task<string?> GetPullRequestHeadSha(string repoOwner, string repoName, int pullRequestNumber, CancellationToken ct)
         {
             // Return a mock SHA
             return Task.FromResult<string?>("abc123def456");
         }
 
-        public Task<string?> GetFileFromPullRequest(string repoOwner, string repoName, int pullRequestNumber, string filePath)
+        public Task<string?> GetFileFromPullRequest(string repoOwner, string repoName, int pullRequestNumber, string filePath, CancellationToken ct)
         {
             // Return null to indicate file not found (default mock behavior)
             return Task.FromResult<string?>(null);
         }
 
-        public Task<string?> GetFileFromBranch(string repoOwner, string repoName, string branch, string filePath)
+        public Task<string?> GetFileFromBranch(string repoOwner, string repoName, string branch, string filePath, CancellationToken ct)
         {
             // Return null to indicate file not found (default mock behavior)
             return Task.FromResult<string?>(null);
         }
 
-        public Task<Octokit.SearchCodeResult> SearchFilesAsync(string searchQuery)
+        public Task<Octokit.SearchCodeResult> SearchFilesAsync(string searchQuery, CancellationToken ct)
         {
             // Return empty search results (default mock behavior)
             var emptyResult = new SearchCodeResult(0, false, new List<SearchCode>());
             return Task.FromResult(emptyResult);
+        }
+
+        public Task<Team> GetTeamByNameAsync(string org, string teamSlug, CancellationToken ct)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<HashSet<string>> GetRepoLabels(string owner, string repo, CancellationToken ct)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<IReadOnlyList<WorkflowRun>> GetFailedWorkflowRunsForCommitAsync(string owner, string repo, string commitSha, CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<WorkflowRun>>([]);
+        }
+
+        public Task<IReadOnlyList<(string Name, string Content)>> GetFailedWorkflowRunLogsAsync(string owner, string repo, long runId, CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<(string Name, string Content)>>([]);
+        }
+
+        public Task<IReadOnlyList<WorkflowJob>> GetWorkflowRunJobsAsync(string owner, string repo, long runId, CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<WorkflowJob>>([]);
+        }
+
+        public Task<List<PrCheckRun>> GetPrCheckRunsAsync(string owner, string repo, int prNumber, CancellationToken ct)
+        {
+            return Task.FromResult(new List<PrCheckRun>());
+        }
+
+        public Task<IReadOnlyList<PullRequest>> GetMergedPullRequestsByTimeFrameAsync(string repoOwner, string repoName, DateTimeOffset since, DateTimeOffset until, CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<PullRequest>>(new List<PullRequest>().AsReadOnly());
+        }
+
+        public Task<IReadOnlyList<PullRequestCommit>> GetPullRequestCommitsAsync(string repoOwner, string repoName, int pullRequestNumber, CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<PullRequestCommit>>([]);
+        }
+
+        public Task<IReadOnlyList<IssueComment>> GetPullRequestIssueCommentsAsync(string repoOwner, string repoName, int pullRequestNumber, CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<IssueComment>>([]);
+        }
+
+        public Task<IReadOnlyList<GitHubCommitFile>> GetCommitFilesAsync(string repoOwner, string repoName, string sha, CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<GitHubCommitFile>>([]);
+        }
+
+        public Task<string> GetBranchHeadShaAsync(string repoOwner, string repoName, string branchName, CancellationToken ct)
+        {
+            return Task.FromResult("0000000000000000000000000000000000000000");
+        }
+
+        public Task<IReadOnlyList<PrCheckRun>> GetCommitCheckRunsAsync(string owner, string repo, string sha, CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<PrCheckRun>>([]);
         }
     }
 }

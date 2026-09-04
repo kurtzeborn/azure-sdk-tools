@@ -2,8 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Security.Claims;
-using APIView.DIff;
-using ApiView;
+using APIView.Diff;
 using APIView;
 using APIViewWeb.Managers;
 using APIViewWeb.Models;
@@ -355,7 +354,7 @@ namespace APIViewWeb.Helpers
             reviewPageContent.codeLines = codeLines;
             reviewPageContent.ActiveConversationsInActiveAPIRevision = ComputeActiveConversationsInActiveRevision(activeRevisionHtmlLines, comments);
 
-            HashSet<string> preferredApprovers = await permissionsManager.GetApproversForLanguageAsync(review.Language);
+            HashSet<string> languageApprovers = await permissionsManager.GetApproversForLanguageAsync(review.Language);
 
             reviewPageContent.Review = review;
             reviewPageContent.Navigation = activeRevisionRenderableCodeFile.CodeFile.Navigation;
@@ -366,7 +365,7 @@ namespace APIViewWeb.Helpers
             reviewPageContent.HasFatalDiagnostics = fileDiagnostics.Any(d => d.Level == APIView.CodeDiagnosticLevel.Fatal);
             reviewPageContent.ActiveConversationsInActiveAPIRevision = ComputeActiveConversationsInActiveRevision(activeRevisionHtmlLines, comments);
             reviewPageContent.ActiveConversationsInSampleRevisions = comments.Threads.Count(t => t.Comments.FirstOrDefault()?.CommentType == CommentType.SampleRevision);
-            reviewPageContent.PreferredApprovers = preferredApprovers;
+            reviewPageContent.LanguageApprovers = languageApprovers;
             reviewPageContent.TaggableUsers = commentManager.GetTaggableUsers();
             reviewPageContent.PageHasLoadableSections = activeRevisionReviewCodeFile.LeafSections?.Any() ?? false;
 

@@ -6,10 +6,36 @@ using System.Text.Json.Serialization;
 namespace Azure.Sdk.Tools.Cli.Models.Responses.Package;
 
 /// <summary>
-/// Response payload for CustomizedCodeUpdateTool MCP / CLI operations.
+/// Represents a single patch that was applied to a customization file.
+/// </summary>
+public record AppliedPatch(
+    string FilePath,
+    string Description,
+    int ReplacementCount);
+
+/// <summary>
+/// Response payload for CustomizedCodeUpdateTool MCP / CLI operations returns success/failure with build result.
 /// </summary>
 public class CustomizedCodeUpdateResponse : PackageResponseBase
 {
+    /// <summary>
+    /// Indicates whether the update operation succeeded (build passed after patches).
+    /// </summary>
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("appliedPatches")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<AppliedPatch>? AppliedPatches { get; set; }
+
+    /// <summary>
+    /// Raw build error output. Only set when Success = false.
+    /// The classifier uses this to determine next steps.
+    /// </summary>
+    [JsonPropertyName("buildResult")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? BuildResult { get; set; }
+
     /// <summary>
     /// Error codes for classifier to parse programmatically.
     /// These define the contract between the tool and downstream processors.
@@ -24,7 +50,41 @@ public class CustomizedCodeUpdateResponse : PackageResponseBase
         public const string NoLanguageService = "NoLanguageService";
         public const string InvalidInput = "InvalidInput";
         public const string UnexpectedError = "UnexpectedError";
+        public const string TypeSpecCustomizationFailed = "TypeSpecCustomizationFailed";
+        public const string ManualInterventionRequired = "ManualInterventionRequired";
+
+        /// <summary>
+        /// Returned when spec inputs are out of scope (<see cref="Models.EditScope.SpecInputs"/> not set):
+        /// the failure can only be fixed by editing the spec inputs (client.tsp / tspconfig.yaml) or moving
+        /// the pinned spec commit, which belongs in a separate spec-repo PR.
+        /// </summary>
+        public const string SpecChangeRequired = "SpecChangeRequired";
+
+        /// <summary>
+        /// Returned when custom code is out of scope (<see cref="Models.EditScope.CustomCode"/> not set):
+        /// the remaining failures can only be fixed by editing customization code, but the current edit
+        /// scope only permits spec-input changes.
+        /// </summary>
+        public const string CustomCodeChangeRequired = "CustomCodeChangeRequired";
     }
+
+    /// <summary>
+    /// Populated when spec inputs are out of scope: items that cannot be fixed by editing custom code and
+    /// instead require a spec-repo change (e.g. a <c>@@clientName</c>/<c>@@access</c> decorator in
+    /// <c>client.tsp</c>). These are reported, not applied — spec inputs are never edited in this scope.
+    /// </summary>
+    [JsonPropertyName("specChangeRequired")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? SpecChangeRequired { get; set; }
+
+    /// <summary>
+    /// Populated when custom code is out of scope: items that can only be fixed by editing customization
+    /// code, but the current edit scope (<see cref="Models.EditScope.SpecInputs"/> only) does not permit
+    /// custom-code changes. These are reported, not applied — custom code is never edited in this scope.
+    /// </summary>
+    [JsonPropertyName("customCodeChangeRequired")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? CustomCodeChangeRequired { get; set; }
 
     [JsonPropertyName("message")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -33,6 +93,10 @@ public class CustomizedCodeUpdateResponse : PackageResponseBase
     [JsonPropertyName("errorCode")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ErrorCode { get; set; }
+
+    [JsonPropertyName("typeSpecChangesSummary")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? TypeSpecChangesSummary { get; set; }
 
     protected override string Format()
     {
@@ -44,6 +108,43 @@ public class CustomizedCodeUpdateResponse : PackageResponseBase
         if (!string.IsNullOrWhiteSpace(ErrorCode))
         {
             sb.AppendLine($"ErrorCode: {ErrorCode}");
+        }
+        if (!string.IsNullOrWhiteSpace(BuildResult))
+        {
+            sb.AppendLine("Build Output:");
+            sb.AppendLine(BuildResult);
+        }
+        if (TypeSpecChangesSummary is { Count: > 0 })
+        {
+            sb.AppendLine("TypeSpec Changes:");
+            foreach (var change in TypeSpecChangesSummary)
+            {
+                sb.AppendLine($"  - {change}");
+            }
+        }
+        if (AppliedPatches is { Count: > 0 })
+        {
+            sb.AppendLine("Code customization patches:");
+            foreach (var patch in AppliedPatches)
+            {
+                sb.AppendLine($"  - {patch.FilePath}: {patch.Description} ({patch.ReplacementCount} replacement(s))");
+            }
+        }
+        if (SpecChangeRequired is { Count: > 0 })
+        {
+            sb.AppendLine("Spec-level fix preferred (shift-left): the canonical fix for the following belongs in the spec inputs (e.g. a @@clientName/@@access decorator in client.tsp), not in custom code. They were reported here, not applied, and should be migrated to a pull request in the Azure REST API specs repository:");
+            foreach (var item in SpecChangeRequired)
+            {
+                sb.AppendLine($"  - {item}");
+            }
+        }
+        if (CustomCodeChangeRequired is { Count: > 0 })
+        {
+            sb.AppendLine("Requires custom-code changes (out of scope for the current edit scope):");
+            foreach (var item in CustomCodeChangeRequired)
+            {
+                sb.AppendLine($"  - {item}");
+            }
         }
         return sb.ToString();
     }

@@ -1,0 +1,62 @@
+# Azure SDK Shared Copilot Skills
+
+Copilot skills that guide AI agents through the Azure SDK development and TypeSpec-to-SDK release workflow.
+These skills are consumed by GitHub Copilot (CLI, VS Code, and Coding Agent) when users work
+with TypeSpec API specifications and Azure SDK generation.
+
+Shared skills (those distributed to other Azure SDK repositories) are identified by
+`distribution: shared` in their SKILL.md frontmatter metadata block.
+
+---
+
+## Available Skills
+
+### Workflow & Utility Skills
+
+| Skill | Triggers | Description |
+| ----- | -------- | ----------- |
+| [generate-sdk-locally](generate-sdk-locally/SKILL.md) | "generate SDK locally", "build SDK", "run SDK tests" | Generate, build, and test Azure SDKs locally from TypeSpec |
+| [prepare-release-plan](prepare-release-plan/SKILL.md) | "create release plan", "link SDK PR to plan" | Create and manage release plan work items |
+| [apiview-feedback-resolution](apiview-feedback-resolution/SKILL.md) | "APIView comments", "resolve API review feedback" | Retrieve and resolve APIView review feedback |
+| [pipeline-troubleshooting](pipeline-troubleshooting/SKILL.md) | "pipeline failed", "build failure", "CI check failing" | Diagnose and resolve SDK CI and generation pipeline failures |
+| [sdk-release](sdk-release/SKILL.md) | "release SDK", "trigger release pipeline" | Check release readiness and trigger SDK releases |
+
+### Development & Meta Skills
+
+These skills help with skill development itself:
+
+| Skill | Triggers | Description |
+| ----- | -------- | ----------- |
+| [skill-authoring](skill-authoring/SKILL.md) | "create a skill", "new skill", "skill template" | Guidelines for writing Agent Skills per agentskills.io spec |
+| [markdown-token-optimizer](markdown-token-optimizer/SKILL.md) | "optimize markdown", "reduce tokens", "token count" | Analyze markdown files for token efficiency |
+
+### Skill Anatomy
+
+Each skill lives in `<name>/` and contains:
+
+```
+<name>/
+├── SKILL.md           # Skill definition: YAML frontmatter + steps + related skills
+├── references/        # Detailed reference docs (offloaded to keep SKILL.md under 500 tokens)
+│   └── *.md
+└── fixtures/          # Domain-specific test fixtures
+    └── <files>
+```
+
+
+---
+
+## Tooling
+
+Skill evals for this repository are authored and run via [`@microsoft/vally-cli`](https://microsoft.github.io/vally/) against the canonical skill set in [`.github/skills/`](../../../.github/skills/README.md) — see that README for the current lint/eval commands. The `azd waza` extension and its per-skill `eval.yaml`/`tasks/*.yaml` files have been retired in favor of Vally.
+
+---
+
+## Project Configuration
+
+- **`.gitignore`** — Excludes eval output directories and temp files
+
+## Further Reading
+
+- [agentskills.io spec](https://agentskills.io) — Skill frontmatter specification
+- [vally docs](https://microsoft.github.io/vally/) — Skill eval runner and graders

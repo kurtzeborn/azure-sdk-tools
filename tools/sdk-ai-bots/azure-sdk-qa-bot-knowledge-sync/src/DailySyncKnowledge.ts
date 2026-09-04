@@ -6,6 +6,9 @@ import { SpectorCaseProcessor } from './services/SpectorCaseProcessor';
 import { ConfigurationLoader, RepositoryConfig, DocumentationSource, Metadata } from './services/ConfigurationLoader';
 import { SearchService } from './services/SearchService';
 import { MetadataResolver } from './services/MetadataResolver';
+import { TypeSpecProcessor } from './services/TypeSpecProcessor';
+import { SampleProcessor } from './services/SampleProcessor';
+import { AlloySampleProcessor } from './services/AlloySampleProcessor';
 
 /**
  * Daily sync knowledge function that processes documentation from various repositories
@@ -75,6 +78,15 @@ export async function processDailySyncKnowledge(): Promise<void> {
         // Preprocess spector cases
         await preprocessSpectorCases(docsDir);
 
+        console.log(`processing typespec-azure-resource-manager library`);
+        processTypeSpec(docsDir, "typespec-azure/packages/typespec-azure-resource-manager/lib");
+
+        console.log(`processing typespec-azure samples`);
+        processSamples(docsDir, "typespec-azure/packages/samples/specs");
+
+        console.log(`processing alloy framework samples`);
+        processAlloySamples(docsDir, "alloy/samples");
+
         console.log('Processing documentation sources...');
         
         console.log('Loading existing blob metadata for change detection...');
@@ -142,6 +154,10 @@ export async function processDailySyncKnowledge(): Promise<void> {
         
         // Clean up expired blobs
         await cleanupExpiredBlobs(allChangedFiles.concat(allUnchangedFiles).concat(allMetadataChangedFiles));
+
+        // Trigger AI Search to reindex the knowledge base so the updated blobs are picked up
+        await searchService.runIndexer();
+
         console.log('Daily sync knowledge processing completed');
 
     } finally {
@@ -181,7 +197,7 @@ function getAuthenticatedUrl(repo: RepositoryConfig): string {
             throw new Error(`Authentication token missing for ${repo.name}`);
         }
         console.log(`Using token authentication for ${repo.name}`);
-        return repo.url.replace('https://', `https://${repo.token}@`);
+        return repo.url.replace('https://', `https://x-access-token:${repo.token}@`);
     }
     
     if (repo.authType === 'ssh') {
@@ -435,12 +451,16 @@ async function processSourceDirectory(
                 const relativePath = path.relative(sourceDir, fullPath);
 
                 // Skip ignored paths
-                if (source.ignoredPaths && source.ignoredPaths.some(p => relativePath.startsWith(p))) {
-                    continue;
+                if (source.ignoredPaths) {
+                    if (source.isGenerated) {
+                        if (source.ignoredPaths.some(p => entry.name.startsWith(p.replace(/[\\/]/g, "#")))) continue;
+                    } else {
+                        if (source.ignoredPaths.some(p => relativePath.startsWith(p))) continue;
+                    }
                 }
 
-                // Skip reference files and release notes
-                if (relativePath.startsWith('reference') || entry.name.startsWith('release-')) {
+                // Skip reference files and dated release notes (release-YYYY-MM-DD)
+                if (relativePath.startsWith('reference') || /^release-\d{4}-\d{2}-\d{2}\.(md|mdx)$/.test(entry.name)) {
                     continue;
                 }
                 
@@ -636,7 +656,7 @@ export function processMarkdownFile(
                 isValid: false
             };
         }
-        if (source.isSpectorTest) {
+        if (source.isGenerated) {
             // remove generated prefix
             processed.filename = processed.filename.replace(/^generated#/, '');
         }
@@ -865,5 +885,38 @@ async function preprocessSpectorCases(docsDir: string): Promise<void> {
     } catch (error) {
         console.error('Error processing spector cases:', error);
         throw error;
+    }
+}
+
+/**
+ * Process TypeSpec samples into generated markdown
+ */
+function processSamples(docsDir: string, relativeSamplesDir: string) : void {
+    try {
+        new SampleProcessor(docsDir, relativeSamplesDir).processSamples();
+    } catch (error) {
+        console.error(`Error processing typespec samples: ${relativeSamplesDir}`, error);
+    }
+}
+
+/**
+ * Process TypeSpec library
+ */
+function processTypeSpec(docsDir: string, relativeLibDir: string) : void {
+    try {
+        new TypeSpecProcessor(docsDir, relativeLibDir).processTypeSpecLibraries();
+    } catch (error) {
+        console.error(`Error processing typespec library: ${relativeLibDir}`, error);
+    }
+}
+
+/**
+ * Process Alloy framework samples into generated markdown
+ */
+function processAlloySamples(docsDir: string, relativeSamplesDir: string) : void {
+    try {
+        new AlloySampleProcessor(docsDir, relativeSamplesDir).processSamples();
+    } catch (error) {
+        console.error(`Error processing alloy framework samples: ${relativeSamplesDir}`, error);
     }
 }

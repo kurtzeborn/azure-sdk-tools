@@ -8,6 +8,8 @@ using Azure.Sdk.Tools.Cli.Helpers;
 using Azure.Sdk.Tools.Cli.Models;
 using Azure.Sdk.Tools.Cli.Models.Responses.Package;
 using Azure.Sdk.Tools.Cli.Services;
+using Azure.Sdk.Tools.Cli.Services.APIView;
+using Azure.Sdk.Tools.Cli.Tools.APIView;
 using Azure.Sdk.Tools.Cli.Tools.Core;
 
 namespace Azure.Sdk.Tools.Cli.Tools.Package
@@ -15,8 +17,10 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
     [McpServerToolType, Description("This type contains the tools to release SDK package")]
     public class SdkReleaseTool(
         IDevOpsService devopsService,
+        IAPIViewService apiViewService,
         ILogger<SdkReleaseTool> logger,
-        IInputSanitizer inputSanitizer) : MCPTool
+        IInputSanitizer inputSanitizer,
+        IEnvironmentHelper environmentHelper) : MCPTool
     {
         private const string ReleaseSdkToolName = "azsdk_release_sdk";
         private const string Pipeline_Success_Status = "Succeeded";
@@ -63,11 +67,11 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
             var language = parseResult.GetValue(languageOpt);
             var branch = parseResult.GetValue(branchOpt);
             var checkReady = parseResult.GetValue(checkReadyOpt);
-            return await ReleasePackageAsync(packageName, language, branch, checkReady);
+            return await ReleasePackageAsync(packageName, language, branch, checkReady, ct);
         }
 
-        [McpServerTool(Name = ReleaseSdkToolName), Description("Releases the specified SDK package for a language. This includes checking if the package is ready for release and triggering the release pipeline. To ONLY check package release readiness pass checkReady as true.")]
-        public async Task<SdkReleaseResponse> ReleasePackageAsync(string packageName, string language, string branch = "main", bool checkReady = false)
+        [McpServerTool(Name = ReleaseSdkToolName), Description("Releases (publishes) an SDK package to the package registry for a language. Use this only to publish a package; it does NOT generate SDK code. This includes checking if the package is ready for release and triggering the release pipeline. To ONLY check package release readiness pass checkReady as true. To generate SDKs (including for all languages in a release plan) use azsdk_run_generate_sdk instead.")]
+        public async Task<SdkReleaseResponse> ReleasePackageAsync(string packageName, string language, string branch = "main", bool checkReady = false, CancellationToken ct = default)
         {
             try
             {
@@ -95,11 +99,11 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
                 }
 
                 // Get the package work item from DevOps
-                var package = await devopsService.GetPackageWorkItemAsync(packageName, language);
+                var package = await devopsService.GetPackageWorkItemAsync(packageName, language, ct: ct);
                 if (package == null)
                 {
                     logger.LogInformation("Exact package not found; falling back to partial matches");
-                    var packages = await devopsService.ListPartialPackageWorkItemAsync(packageName, language);
+                    var packages = await devopsService.ListPartialPackageWorkItemAsync(packageName, language, ct);
                     if (packages == null || packages.Count == 0)
                     {
                         response.ReleaseStatusDetails = $"No package work item found for package '{packageName}' in language '{language}'. Please check the package name and language and also make sure that SDK is merged to main branch in the specific language repo.";
@@ -126,13 +130,21 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
                 }
 
                 // Check if the package is ready for release
-                var releaseReadiness = await CheckPackageReleaseReadinessAsync(packageName, language);
+                var releaseReadiness = await CheckPackageReleaseReadinessAsync(packageName, language, ct);
+                var isAgentTesting = environmentHelper.GetBooleanVariable("AZSDKTOOLS_AGENT_TESTING", false);
                 if (!releaseReadiness.IsPackageReady)
                 {
-                    response.ReleaseStatusDetails = $"Package is not ready for release. {releaseReadiness.PackageReadinessDetails}";
-                    response.ReleasePipelineStatus = "Failed";
-                    logger.LogError("{details}", response.ReleaseStatusDetails);
-                    return response;
+                    if (isAgentTesting)
+                    {
+                        logger.LogWarning("AZSDKTOOLS_AGENT_TESTING=true; bypassing failed readiness check ({details}) and continuing to pipeline trigger for E2E testing.", releaseReadiness.PackageReadinessDetails);
+                    }
+                    else
+                    {
+                        response.ReleaseStatusDetails = $"Package is not ready for release. {releaseReadiness.PackageReadinessDetails}";
+                        response.ReleasePipelineStatus = "Failed";
+                        logger.LogError("{details}", response.ReleaseStatusDetails);
+                        return response;
+                    }
                 }
 
                 // If check-ready mode, return readiness check results without triggering release
@@ -144,20 +156,48 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
                 }
 
                 var buildDefinitionId = package?.PipelineDefinitionUrl?.Split('=')?.LastOrDefault();
-                logger.LogInformation("Package {packageName} is ready for release in {language}.", packageName, language);
+                if (releaseReadiness.IsPackageReady)
+                {
+                    logger.LogInformation("Package {packageName} is ready for release in {language}.", packageName, language);
+                }
                 logger.LogInformation("Release pipeline: {pipelineUrl}", package?.PipelineDefinitionUrl);
                 logger.LogInformation("Triggering release pipeline for package {packageName} in {language}...", packageName, language);
 
                 // Trigger the release pipeline
                 if (buildDefinitionId != null)
                 {
-                    var releasePipelineRun = await devopsService.RunPipelineAsync(int.Parse(buildDefinitionId!), new Dictionary<string, string>(), branch);
+                    var templateParams = new Dictionary<string, string>();
+
+                    // Java pipelines require release_<safeName>=true to select a package (azure-sdk-for-java#48465).
+                    if (SdkLanguageHelpers.GetSdkLanguage(language) == SdkLanguage.Java)
+                    {
+                        // Prefer the canonical package name from the work item over the user-supplied input.
+                        var canonicalPackageName = !string.IsNullOrWhiteSpace(package?.PackageName) ? package!.PackageName : packageName;
+                        var safeName = GetJavaSafeName(canonicalPackageName);
+                        if (string.IsNullOrEmpty(safeName))
+                        {
+                            response.ReleaseStatusDetails = $"Cannot derive a Java release pipeline parameter from package name '{canonicalPackageName}'. Expected a name with at least one alphanumeric character.";
+                            response.ReleasePipelineStatus = "Failed";
+                            logger.LogError("{details}", response.ReleaseStatusDetails);
+                            return response;
+                        }
+                        templateParams[$"release_{safeName}"] = "true";
+                    }
+
+                    logger.LogInformation(
+                        "Queueing pipeline {buildDefinitionId} on branch {branch} with templateParameters: {templateParams}",
+                        buildDefinitionId,
+                        branch,
+                        System.Text.Json.JsonSerializer.Serialize(templateParams));
+
+                    var releasePipelineRun = await devopsService.RunPipelineAsync(int.Parse(buildDefinitionId!), templateParams, branch, ct);
                     if (releasePipelineRun != null)
                     {
                         response.ReleasePipelineRunUrl = DevOpsService.GetPipelineUrl(releasePipelineRun.Id);
                         response.PipelineBuildId = releasePipelineRun.Id;
                         response.ReleasePipelineStatus = releasePipelineRun.Status?.ToString() ?? "";
                         response.ReleaseStatusDetails = $"Release pipeline triggered successfully for package '{packageName}' in language '{language}'. Check the status of the pipeline after some time and approve the SDK release using the link to the pipeline run. You can find more information about release approval in https://aka.ms/azsdk/publishsdk";
+                        response.NextSteps = ["Prompt the user to approve the release stage in the pipeline run using the pipeline link", "After release completes, prompt the user to verify the package is published to the registry"];
                         logger.LogInformation("{details}", response.ReleaseStatusDetails);
                     }
                     else
@@ -190,11 +230,11 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
             }
         }
 
-        private async Task<PackageWorkitemResponse> CheckPackageReleaseReadinessAsync(string packageName, string language)
+        private async Task<PackageWorkitemResponse> CheckPackageReleaseReadinessAsync(string packageName, string language, CancellationToken ct)
         {
             try
             {
-                var package = await devopsService.GetPackageWorkItemAsync(packageName, language);
+                var package = await devopsService.GetPackageWorkItemAsync(packageName, language, ct: ct);
                 if (package == null)
                 {
                     package = new PackageWorkitemResponse
@@ -244,7 +284,37 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
                     {
                         package.IsPackageReady = false;
                         package.PackageReadinessDetails += $"API view is not approved for GA release of package '{packageName}'. ";
+
+                        // Resolve APIView URL so the user can navigate directly to the review
+                        try
+                        {
+                            string? resolvedLanguage = APIViewReviewTool.ResolveLanguage(language);
+                            if (resolvedLanguage != null)
+                            {
+                                var apiViewUrl = await apiViewService.GetReviewUrlByPackageAsync(packageName, resolvedLanguage, package.Version, ct);
+                                if (!string.IsNullOrEmpty(apiViewUrl))
+                                {
+                                    package.ApiViewUrl = apiViewUrl;
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning(ex, "Failed to resolve APIView URL for package '{PackageName}' in language '{Language}'.", packageName, language);
+                        }
+
+                        // If URL could not be resolved, provide fallback guidance
+                        if (string.IsNullOrEmpty(package.ApiViewUrl))
+                        {
+                            package.PackageReadinessDetails += $"Search for the API review at https://apiview.dev by selecting the language and searching for '{packageName}'. ";
+                        }
+                        else
+                        {
+                            package.PackageReadinessDetails += $"API Review required at {package.ApiViewUrl}. ";
+                        }
                     }
+
+                    
                 }
                 else
                 {
@@ -253,7 +323,7 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
                 }
 
                 // Check last pipeline run status for the package and verify it completed successfully
-                package.LatestPipelineStatus = await GetPipelineRunDetails(package.LatestPipelineRun);
+                package.LatestPipelineStatus = await GetPipelineRunDetails(package.LatestPipelineRun, ct);
                 bool hasPipelineWarning = string.IsNullOrEmpty(package.LatestPipelineStatus) || !package.LatestPipelineStatus.Contains(Pipeline_Success_Status);
 
                 // Package release readiness status
@@ -286,7 +356,7 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
             }
         }
 
-        private async Task<string> GetPipelineRunDetails(string pipelineRunUrl)
+        private async Task<string> GetPipelineRunDetails(string pipelineRunUrl, CancellationToken ct)
         {
             try
             {
@@ -295,7 +365,7 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
                 {
                     var buildId = int.Parse(pipelineRunUrl.Split("buildId=").LastOrDefault());
                     logger.LogInformation("Extracted build ID: {buildId}", buildId);
-                    var pipelineRun = await devopsService.GetPipelineRunAsync(buildId);
+                    var pipelineRun = await devopsService.GetPipelineRunAsync(buildId, ct);
                     if (pipelineRun != null)
                     {
                         logger.LogInformation(
@@ -317,6 +387,18 @@ namespace Azure.Sdk.Tools.Cli.Tools.Package
                 logger.LogError(ex, "Failed to get pipeline run details for URL {PipelineRunUrl}", pipelineRunUrl);
                 return $"Failed to get pipeline run details. Error: {ex.Message}";
             }
+        }
+
+        // safeName matches azure-sdk-for-java ci.yml: lowercase, alphanumerics only (e.g. "azure-storage-blob" -> "azurestorageblob").
+        public static string GetJavaSafeName(string packageName)
+        {
+            if (string.IsNullOrWhiteSpace(packageName))
+            {
+                return string.Empty;
+            }
+
+            var chars = packageName.Where(char.IsLetterOrDigit).ToArray();
+            return new string(chars).ToLowerInvariant();
         }
     }
 }

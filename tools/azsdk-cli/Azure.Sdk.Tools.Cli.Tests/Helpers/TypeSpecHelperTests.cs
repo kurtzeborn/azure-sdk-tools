@@ -1,4 +1,5 @@
 using Azure.Sdk.Tools.Cli.Helpers;
+using Azure.Sdk.Tools.Cli.Models;
 using Azure.Sdk.Tools.Cli.Services;
 using Azure.Sdk.Tools.Cli.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -20,7 +21,8 @@ namespace Azure.Sdk.Tools.Cli.Tests.Helpers
             gitHubService = new Mock<IGitHubService>();
             var gitCommandHelper = new GitCommandHelper(NullLogger<GitCommandHelper>.Instance, Mock.Of<IRawOutputHelper>());
             gitHelper = new GitHelper(gitHubService.Object, gitCommandHelper, logger);
-            typeSpecHelper = new TypeSpecHelper(gitHelper);
+            var processHelper = new ProcessHelper(new TestLogger<ProcessHelper>(), Mock.Of<IRawOutputHelper>());
+            typeSpecHelper = new TypeSpecHelper(gitHelper, processHelper);
         }
 
         [Test]
@@ -32,6 +34,22 @@ namespace Azure.Sdk.Tools.Cli.Tests.Helpers
             testCodeFilePath = "TypeSpecTestData/specification/testcontoso";
             result = typeSpecHelper.IsValidTypeSpecProjectPath(testCodeFilePath);
             Assert.That(result, Is.False);
+        }
+
+        [Test]
+        public void Verify_IsValidTypeSpecProject_with_tspconfig_path()
+        {
+            var configPath = "TypeSpecTestData/specification/testcontoso/Contoso.Management/tspconfig.yaml";
+            Assert.That(typeSpecHelper.IsValidTypeSpecProjectPath(configPath), Is.True);
+            Assert.That(typeSpecHelper.IsValidTypeSpecProjectPath(Path.GetFullPath(configPath)), Is.True);
+        }
+
+        [Test]
+        public void Test_GetTypeSpecProjectRelativePath_strips_tspconfig_filename()
+        {
+            var configPath = "TypeSpecTestData/specification/testcontoso/Contoso.Management/tspconfig.yaml";
+            var result = typeSpecHelper.GetTypeSpecProjectRelativePath(configPath);
+            Assert.That(result, Is.EqualTo("specification/testcontoso/Contoso.Management"));
         }
 
         [TestCase("https://github.com/Azure/azure-rest-api-specs/blob/main/specification/dell/Dell.Storage.Management")]
@@ -92,6 +110,8 @@ namespace Azure.Sdk.Tools.Cli.Tests.Helpers
         [TestCase("https://github.com/Azure/azure-rest-api-specs/blob/main/specification/dell/Dell.Storage.Management", "specification/dell/Dell.Storage.Management")]
         [TestCase("https://github.com/Azure/azure-rest-api-specs/blob/feature/specification/contoso/Contoso.Service", "specification/contoso/Contoso.Service")]
         [TestCase("https://github.com/Azure/azure-rest-api-specs/blob/main/specification/test/Test.Service?query=param#L123", "specification/test/Test.Service")]
+        [TestCase("https://github.com/Azure/azure-rest-api-specs/blob/main/specification/dell/Dell.Storage.Management/tspconfig.yaml", "specification/dell/Dell.Storage.Management")]
+        [TestCase("https://github.com/Azure/azure-rest-api-specs/blob/main/specification/test/Test.Service/tspconfig.yaml?query=param", "specification/test/Test.Service")]
         [Test]
         public void Test_GetTypeSpecProjectRelativePathFromUrl(string url, string expected)
         {
@@ -110,7 +130,8 @@ namespace Azure.Sdk.Tools.Cli.Tests.Helpers
         public async Task Test_IsRepoPathForSpecRepo(Uri repo)
         {
             var gitHelper = CreateGitHelper(repo);
-            var helper = new TypeSpecHelper(gitHelper);
+            var processHelper = new ProcessHelper(new TestLogger<ProcessHelper>(), Mock.Of<IRawOutputHelper>());
+            var helper = new TypeSpecHelper(gitHelper, processHelper);
             Assert.That(await helper.IsRepoPathForSpecRepoAsync("unused because of mock"), "is a specs repo (public or private)");
         }
 
@@ -122,7 +143,8 @@ namespace Azure.Sdk.Tools.Cli.Tests.Helpers
         [Test]
         public async Task Test_IsRepoPathForPublicSpecRepo(Uri repo)
         {
-            var helper = new TypeSpecHelper(CreateGitHelper(repo));
+            var processHelper = new ProcessHelper(new TestLogger<ProcessHelper>(), Mock.Of<IRawOutputHelper>());
+            var helper = new TypeSpecHelper(CreateGitHelper(repo), processHelper);
             Assert.That(!await helper.IsRepoPathForPublicSpecRepoAsync("unused because of the mock"), "not the public specs repo");
         }
 
@@ -131,6 +153,65 @@ namespace Azure.Sdk.Tools.Cli.Tests.Helpers
             var gitHelperMock = new Mock<IGitHelper>();
             gitHelperMock.Setup(ghm => ghm.GetRepoRemoteUriAsync(It.IsAny<string>(), It.IsAny<CancellationToken>())).ReturnsAsync(getRepoRemoteUri);
             return gitHelperMock.Object;
+        }
+        [Test]
+        public async Task Test_ParseTypeSpecProjectAsync_parses_package_names_from_typespec_project()
+        {
+            var testCodeFilePath = "TypeSpecTestData/specification/testcontoso/Contoso.Management";
+            var logger = new TestLogger<TypeSpecHelperTests>();
+
+            // Metadata YAML that the emitter would produce
+            var metadataYaml = """
+            languages:
+              .NET:
+                packageName: Azure.ResourceManager.Contoso
+              Java:
+                packageName: com.azure.resourcemanager.contoso
+              Python:
+                packageName: azure-mgmt-contoso
+              JavaScript:
+                packageName: "@azure/arm-contoso"
+              Go:
+                packageName: sdk/resourcemanager/contoso/armcontoso
+              UnknownEmitter:
+                packageName: unknown-package
+            """;
+
+            // Set up the metadata output directory and file as the emitter would
+            var metadataDir = Path.Combine(testCodeFilePath, "tsp-output", "@azure-tools", "typespec-metadata");
+            Directory.CreateDirectory(metadataDir);
+            var metadataFilePath = Path.Combine(metadataDir, "typespec-metadata.yaml");
+            await File.WriteAllTextAsync(metadataFilePath, metadataYaml);
+
+            try
+            {
+                // Mock npx to return success (emitter ran successfully)
+                var mockNpxHelper = new Mock<INpxHelper>();
+                mockNpxHelper.Setup(x => x.Run(It.IsAny<NpxOptions>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new ProcessResult { ExitCode = 0 });
+
+                var result = await typeSpecHelper.ParseTypeSpecProjectAsync(testCodeFilePath, mockNpxHelper.Object, logger, CancellationToken.None);
+
+                Assert.IsNotNull(result);
+                Assert.That(result.Packages.Count, Is.EqualTo(5));
+                Assert.That(result.IsManagementPlane, Is.True);
+
+                Assert.That(result.Packages.Any(p => p.Language == SdkLanguage.DotNet && p.PackageName == "Azure.ResourceManager.Contoso"));
+                Assert.That(result.Packages.Any(p => p.Language == SdkLanguage.Java && p.PackageName == "com.azure.resourcemanager.contoso"));
+                Assert.That(result.Packages.Any(p => p.Language == SdkLanguage.Python && p.PackageName == "azure-mgmt-contoso"));
+                Assert.That(result.Packages.Any(p => p.Language == SdkLanguage.JavaScript && p.PackageName == "@azure/arm-contoso"));
+                Assert.That(result.Packages.Any(p => p.Language == SdkLanguage.Go && p.PackageName == "sdk/resourcemanager/contoso/armcontoso"));
+                Assert.That(result.Packages, Has.None.Matches<PackageInfo>(p => p.Language == SdkLanguage.Unknown));
+            }
+            finally
+            {
+                // Clean up the generated metadata directory
+                var tspOutputDir = Path.Combine(testCodeFilePath, "tsp-output");
+                if (Directory.Exists(tspOutputDir))
+                {
+                    Directory.Delete(tspOutputDir, recursive: true);
+                }
+            }
         }
     }
 }

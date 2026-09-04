@@ -20,9 +20,10 @@ namespace Azure.Sdk.Tools.SnippetGenerator
     {
         private const string _snippetPrefix = "Snippet:";
         private readonly string _directory;
+        private readonly string _targetDirectory;
         private readonly Lazy<Task<List<Snippet>>> _snippets;
         private static readonly Regex _markdownOnlyRegex = new Regex(
-            @"(?<indent>\s*)//@@\s*(?<line>.*)",
+            @"(?<indent>\s*)//@@ ?(?<line>.*)",
             RegexOptions.Compiled | RegexOptions.Singleline | RegexOptions.CultureInvariant);
         private const string _codeOnlyPattern = "/*@@*/";
         private static readonly Regex _regionRegex = new Regex(
@@ -32,9 +33,10 @@ namespace Azure.Sdk.Tools.SnippetGenerator
         private UTF8Encoding _utf8EncodingWithoutBOM;
         private static string[] _snippetPreprocessorSymbols = new [] {"SNIPPET"};
 
-        public DirectoryProcessor(string directory)
+        public DirectoryProcessor(string directory, string targetDirectory = null)
         {
             _directory = directory;
+            _targetDirectory = targetDirectory ?? directory;
             _snippets = new Lazy<Task<List<Snippet>>>(DiscoverSnippetsAsync);
         }
 
@@ -43,8 +45,8 @@ namespace Azure.Sdk.Tools.SnippetGenerator
             if (files is null)
             {
                 List<string> discoveredFiles = new();
-                discoveredFiles.AddRange(Directory.EnumerateFiles(_directory, "*.md", SearchOption.AllDirectories));
-                discoveredFiles.AddRange(Directory.EnumerateFiles(_directory, "*.cs", SearchOption.AllDirectories));
+                discoveredFiles.AddRange(Directory.EnumerateFiles(_targetDirectory, "*.md", SearchOption.AllDirectories));
+                discoveredFiles.AddRange(Directory.EnumerateFiles(_targetDirectory, "*.cs", SearchOption.AllDirectories));
 
                 files = discoveredFiles;
             }

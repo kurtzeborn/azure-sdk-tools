@@ -1,0 +1,101 @@
+# Azure SDK Shared Copilot Skills
+
+Copilot skills that guide AI agents through the Azure SDK development and TypeSpec-to-SDK release workflow.
+These skills are consumed by GitHub Copilot (CLI, VS Code, and Coding Agent) when users work
+with TypeSpec API specifications and Azure SDK generation.
+
+Shared skills (those distributed to other Azure SDK repositories) are identified by
+`distribution: shared` in their SKILL.md frontmatter metadata block and use the
+`azsdk-common-` directory prefix. This prefix enables the `sync-.github-skills.yml`
+pipeline to match and distribute them to all subscribed language SDK repos.
+
+---
+
+## Available Skills
+
+### Workflow & Utility Skills
+
+| Skill                                                                                         | Triggers                                               | Description                                                 |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------- |
+| [azsdk-common-generate-sdk-locally](azsdk-common-generate-sdk-locally/SKILL.md)               | "generate SDK locally", "build SDK", "run SDK tests"   | Generate, build, and test Azure SDKs locally from TypeSpec  |
+| [azsdk-common-prepare-release-plan](azsdk-common-prepare-release-plan/SKILL.md)               | "create release plan", "link SDK PR to plan"           | Create and manage release plan work items                   |
+| [azsdk-common-apiview-feedback-resolution](azsdk-common-apiview-feedback-resolution/SKILL.md) | "APIView comments", "resolve API review feedback"      | Retrieve and resolve APIView review feedback                |
+| [azsdk-common-pipeline-analysis](azsdk-common-pipeline-analysis/SKILL.md)                     | "pipeline failed", "build failure", "CI check failing" | Analyze SDK CI failures and prescribe fixes without editing |
+| [azsdk-common-pipeline-fixer](azsdk-common-pipeline-fixer/SKILL.md)                           | "fix pipeline", "fix CI", "fix failing tests"          | Apply and verify fixes from pipeline analysis               |
+| [azsdk-common-sdk-release](azsdk-common-sdk-release/SKILL.md)                                 | "release SDK", "trigger release pipeline"              | Check release readiness and trigger SDK releases            |
+
+### Development & Meta Skills
+
+These skills help with skill development itself:
+
+The three eval-authoring skills share the repository-local [eval authoring guide](eval-authoring/README.md).
+
+| Skill                                                                                 | Triggers                                            | Description                                                           |
+| ------------------------------------------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------- |
+| [skill-authoring](skill-authoring/SKILL.md)                                           | "create a skill", "new skill", "skill template"     | Guidelines for writing Agent Skills per agentskills.io spec           |
+| [eval-authoring-skill](eval-authoring-skill/SKILL.md)                                 | "write a skill eval", "test skill routing"          | Author repository-local routing and capability evals for Agent Skills |
+| [eval-authoring-tool](eval-authoring-tool/SKILL.md)                                   | "write a tool eval", "add prompt-to-tool coverage"  | Author repository-local hermetic single-tool MCP selection evals      |
+| [eval-authoring-workflow](eval-authoring-workflow/SKILL.md)                           | "write a workflow eval", "create multi-turn eval"   | Author repository-local multi-tool, multi-turn, mock, and live evals  |
+| [markdown-token-optimizer](markdown-token-optimizer/SKILL.md)                         | "optimize markdown", "reduce tokens", "token count" | Analyze markdown files for token efficiency                           |
+
+### Skill Anatomy
+
+Each skill lives in `<name>/` and contains:
+
+```text
+<name>/
+├── SKILL.md           # Skill definition: YAML frontmatter + steps + related skills
+├── references/        # Detailed reference docs (offloaded to keep SKILL.md under 500 tokens)
+│   └── *.md
+└── evals/             # Evaluation definitions
+    └── eval.yaml       # Routing (trigger/anti-trigger) + capability stimuli together;
+                        # split into additional *.eval.yaml files (e.g. <behavior>.eval.yaml,
+                        # or the older trigger.eval.yaml naming some existing skills still use)
+                        # once coverage grows large
+```
+
+---
+
+## Tooling
+
+| Tool                                            | Purpose                             | Install                               |
+| ----------------------------------------------- | ----------------------------------- | ------------------------------------- |
+| [**vally**](https://microsoft.github.io/vally/) | Run skill evals, grade trajectories | `npm install -g @microsoft/vally-cli` |
+
+### Linting Evals
+
+```bash
+cd .github/skills
+
+# Lint all eval files
+vally lint .
+```
+
+### Running Evals
+
+```bash
+cd .github/skills
+
+# Run all ci-gate evals
+vally eval --tag "type=ci-gate"
+
+# Run evals for a specific skill
+vally eval --tag area="skill-authoring"
+
+# Run with an output directory for logs
+vally eval --tag area="markdown-token-optimizer" --output-dir ./results
+```
+
+The [Skill Evaluations workflow](../workflows/skill-eval.yml) runs Vally lint when skill files or the pinned Vally dependency change.
+
+---
+
+## Project Configuration
+
+- **`.vally.yaml`** — Eval paths, environments (MCP server configs), and result output
+- **`.gitignore`** — Excludes eval output directories and temp files
+
+## Further Reading
+
+- [agentskills.io spec](https://agentskills.io) — Skill frontmatter specification
+- [vally docs](https://microsoft.github.io/vally/) — Eval runner and graders

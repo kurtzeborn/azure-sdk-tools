@@ -1,0 +1,61 @@
+# Mirror selected workflow files in the .github directory to all subscribed repos
+#
+# For more information on this file, please see:
+# doc/engsys_workflows_and_skills.md
+parameters:
+- name: DirectoryToSync
+  type: string
+  default: .github/workflows
+  # Remember to update the path includes below as well as the eng-common-workflow-enforcer.yml
+  # and .github/workflows/protected-files.yml files if you update this list.
+- name: FilePatterns
+  type: object
+  default:
+    - '*event*'
+    - 'post-apiview.yml'
+    - 'protected-files.yml'
+    - 'verify-links.yml'
+- name: Repos
+  type: object
+  default:
+    - RepoOwner: Azure
+      RepoName: azure-sdk
+    - RepoOwner: Azure
+      RepoName: azure-sdk-for-cpp
+    - RepoOwner: Azure
+      RepoName: azure-sdk-for-go
+    - RepoOwner: Azure
+      RepoName: azure-sdk-for-ios
+    - RepoOwner: Azure
+      RepoName: azure-sdk-for-java
+    - RepoOwner: Azure
+      RepoName: azure-sdk-for-js
+    - RepoOwner: Azure
+      RepoName: azure-sdk-for-net
+    - RepoOwner: Azure
+      RepoName: azure-sdk-for-python
+    - RepoOwner: Azure
+      RepoName: azure-sdk-for-rust
+    # TODO: Re-enable syncing to specs repo after we standardize on workflow linting/naming
+    # - RepoOwner: Azure
+    #   RepoName: azure-rest-api-specs
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      # Workflows
+      - .github/workflows/*event*
+      - .github/workflows/post-apiview.yml
+      - .github/workflows/protected-files.yml
+      - .github/workflows/verify-links.yml
+extends:
+  template: /eng/pipelines/templates/stages/archetype-sdk-tool-repo-sync.yml
+  parameters:
+    DirectoryToSync: ${{ parameters.DirectoryToSync }}
+    FilePatterns: ${{ parameters.FilePatterns }}
+    Repos: ${{ parameters.Repos }}
